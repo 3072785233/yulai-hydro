@@ -21,6 +21,31 @@ const SOURCES = [
 // 注意：航道水位按当地航行基准面起算，与长江委站（绝对高程）基准不同，站对象标 src:'mot' 区分展示
 const MOT_LIST = 'https://www.mot.gov.cn/fuwu/yujingtishi/cjshuiweichaowei/';
 
+// 7 号源：湖北省水情平台（单站页直出 ECharts 10 天逐小时序列，小时级）
+// 平台列表页依赖 Redis 不稳定（时常 500）→ 用固定站码表逐站抓单站页，坏一个站不影响其他
+// 站码为全国统一水文编码，与长江委 5 源按 stcd 自动去重（保留时间较新者）；
+// 补长江委对外页没有的：四口洪道 / 汉江中下游 / 倒举巴·浠河 / 江汉平原诸站
+const HB_STATIONS = [
+  ['60105400', '寸滩', '长江'], ['60107300', '宜昌', '长江'], ['60107400', '枝城', '长江'],
+  ['60108300', '沙市', '长江'], ['60109400', '石首', '长江'], ['60110500', '监利', '长江'],
+  ['60111200', '莲花塘', '长江'], ['60111300', '螺山', '长江'], ['60112200', '汉口', '长江'],
+  ['60112900', '黄石港', '长江'], ['60113205', '码头镇', '长江'], ['60113400', '九江', '长江'],
+  ['60803000', '武隆', '乌江'], ['60908000', '河溶', '沮漳河'], ['61607000', '阳新', '富水'],
+  ['61500300', '新江口', '松滋河'], ['61501200', '沙道观', '松滋河'], ['61501500', '弥陀寺', '虎渡河'],
+  ['61501800', '藕池(康)', '藕池河'], ['61502200', '藕池(管)', '藕池河'], ['61512000', '城陵矶(七里山)', '洞庭湖口'],
+  ['61801300', '安康', '汉江'], ['61801700', '白河', '汉江'], ['61802800', '黄家港', '汉江'],
+  ['61803400', '襄阳', '汉江'], ['61803500', '宜城', '汉江'], ['61804110', '皇庄', '汉江'],
+  ['61804210', '沙洋(三)', '汉江'], ['61804250', '兴隆', '汉江'], ['61804400', '岳口', '汉江'],
+  ['61804600', '仙桃(二)', '汉江'], ['61804710', '汉川', '汉江'],
+  ['62201400', '隔蒲潭', '府河'], ['62201800', '卧龙潭', '澴水'], ['62205800', '孝感', '府澴河'],
+  ['62206900', '天门', '天门河'], ['62209400', '应城', '大富水'], ['62213000', '潜江', '田关河'],
+  ['61609400', '黄陂', '滠水'], ['61610600', '李家集', '倒水'], ['61612400', '柳子港', '举水'],
+  ['61615600', '马家潭', '巴河'], ['61619600', '西河驿', '浠水'], ['62016400', '郭滩', '唐白河'],
+  ['62601600', '湖口', '鄱阳湖口'],
+];
+// 注意走 http：该站 TLS 是老旧 legacy renegotiation，Node18+（OpenSSL 3）握手直接拒绝
+const HB_BASE = 'http://hbwater.wetruetech.com/water/portal/wx_station_info?stationCode=';
+
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
@@ -77,6 +102,87 @@ async function fetchMot() {
   }
   if (!rows.length) throw new Error('文章里没解析到站点行');
   console.log(`[ok] mot 交通部长江水位表 ${m[2]}-${m[3]}-${m[4]} ${m[5]}时 · ${rows.length} 站`);
+  return rows;
+}
+
+/** 湖北省水情平台：逐站抓单站页，解析 ECharts 的 横轴(月,日,时) + 水位 + 流量 三条序列 */
+async function fetchHubei() {
+  const rows = [];
+  let okN = 0;
+  const CONC = 3; // 并发高了这个老服务器会随机甩 413
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < HB_STATIONS.length; i += CONC) {
+    await Promise.all(
+      HB_STATIONS.slice(i, i + CONC).map(async ([code, name, rv]) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await sleep(900);
+          try {
+          const html = await fetchText(HB_BASE + code, 20000);
+          // 图例（data:['水位','流量']）之后的长数组依次是：横轴、水位、流量
+          const legend = html.match(/data: ?\['水位','流量'\]/);
+          if (!legend) throw new Error('页面模板变了');
+          const tail = html.slice(legend.index + legend[0].length);
+          const arrs = [...tail.matchAll(/data: ?\[([\s\S]*?)\]/g)]
+            .map((m) => ({ raw: m[1], nums: (m[1].match(/-?\d+(?:\.\d+)?/g) || []).map(Number) }))
+            .filter((a) => a.nums.length > 0);
+          // 横轴是 'MM-DD HH' 字符串三元组（长度被3整除）；其后两条长度=点数的序列是 水位、流量
+          // 有的站 6 小时一报（10 天只有 40 来点），不能用「点数多」当判据
+          // 注意日不能走数字正则——'10-29' 的连字符会把日期吃成 -29
+          let xRaw = null, zSe = null, qSe = null;
+          for (let k = 0; k < arrs.length; k++) {
+            const a = arrs[k];
+            if (a.nums.length >= 6 && a.nums.length % 3 === 0) {
+              const n = a.nums.length / 3;
+              const toks = a.raw.match(/'(\d{1,2})-(\d{1,2}) (\d{1,2})'/g) || [];
+              if (toks.length !== n) continue;
+              const after = arrs.slice(k + 1).filter((b) => b.nums.length === n);
+              if (after.length >= 1) { xRaw = toks; zSe = after[0].nums; qSe = after[1] ? after[1].nums : null; break; }
+            }
+          }
+          if (!xRaw) throw new Error('没找到横轴+序列');
+          // 横轴是 月,日,时 三元组 → epoch（北京时间）。年份推断：取离现在最近且不超前的
+          const now = Date.now();
+          const epoch = (mo, d, hh) => {
+            const y = new Date().getFullYear();
+            for (const yy of [y, y - 1]) {
+              const t = Date.UTC(yy, mo - 1, d, hh - 8, 0, 0);
+              if (t <= now + 3600e3) return t;
+            }
+            return null;
+          };
+          const pts = [];
+          for (let k = 0; k < xRaw.length; k++) {
+            const [, mo, d, hh] = xRaw[k].match(/(\d{1,2})-(\d{1,2}) (\d{1,2})/);
+            const t = epoch(+mo, +d, +hh);
+            if (t != null && zSe[k] != null) pts.push([t, Math.round(zSe[k] * 100) / 100]);
+          }
+          if (pts.length < 2) throw new Error('序列解析为空');
+          const last = pts[pts.length - 1];
+          const q = qSe ? qSe[qSe.length - 1] : 0;
+          // 水势：与上一个不相等的点比（±0.01 视为平）
+          let w = 'unk';
+          for (let k = pts.length - 2; k >= 0; k--) {
+            if (Math.abs(pts[k][1] - last[1]) >= 0.01) {
+              w = pts[k][1] < last[1] ? 'rise' : 'fall';
+              break;
+            } else if (pts.length - 1 - k >= 2) { w = 'flat'; break; }
+          }
+          rows.push({
+            stcd: code, stnm: name, rvnm: rv,
+            z: last[1], q: Math.round(Number(q) || 0), tm: last[0], w, src: 'hb',
+            d24: delta24(pts, last[0]), // 页面自带10天序列，首抓就有24h变幅
+          });
+          okN++;
+          break;
+          } catch (e) {
+            if (attempt) console.log(`     hb ${name} → ${String(e.message || e).slice(0, 50)}`);
+          }
+        }
+      })
+    );
+  }
+  if (!rows.length) throw new Error('45 站全军覆没（平台可能又在 500）');
+  console.log(`[ok] hb 湖北省水情平台 ${okN}/${HB_STATIONS.length} 站`);
   return rows;
 }
 
@@ -147,6 +253,20 @@ async function main() {
     })
   );
 
+  // 7 号源：湖北省水情平台（独立容错；全国统一站码，与长江委重码站保留 tm 较新者）
+  try {
+    const hb = await fetchHubei();
+    let added = 0;
+    for (const r of hb) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.hb = `ok ${added}/${hb.length}站`;
+  } catch (e) {
+    sources.hb = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] hb →', e.message);
+  }
+
   // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）
   try {
     const mot = await fetchMot();
@@ -203,13 +323,26 @@ async function main() {
       q: r.q,
       tm: r.tm,
       w: r.w,
-      // mot 站的 24h 变幅直接用公告表的「涨落」列（官方口径）；长江委站由走势推算
-      d24: r.src === 'mot' && r.d24 != null ? r.d24 : delta24(h, r.tm || now),
+      // mot 站用公告「涨落」列、hb 站用页面序列自带的 24h 变幅（首次抓取即有）；长江委站由走势推算
+      d24: r.d24 != null ? r.d24 : delta24(h, r.tm || now),
       src: r.src || 'cjh',
       h,
     };
     stations.push(st);
   }
+  // 短暂断源的站不硬删：上一轮快照有、这轮没抓到且数据还在 48h 内的，原样保留
+  // （比如湖北平台偶发 413/500 封一轮——站消失一小时比显示两小时前的读数更伤）
+  if (prev && Array.isArray(prev.stations)) {
+    const have = new Set(stations.map((s) => s.stcd));
+    let kept = 0;
+    for (const old of prev.stations) {
+      if (have.has(old.stcd) || !old.tm || old.tm < now - 48 * 3600e3) continue;
+      stations.push(old);
+      kept++;
+    }
+    if (kept) console.log(`断源保留 ${kept} 站（沿用上轮读数，时间戳即滞后程度）`);
+  }
+
   stations.sort((a, b) => (a.rvnm + a.stnm).localeCompare(b.rvnm + b.stnm, 'zh'));
 
   const out = { v: 1, updated: new Date().toISOString(), sources, stations };
