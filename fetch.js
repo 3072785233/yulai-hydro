@@ -16,15 +16,20 @@ const SOURCES = [
   { key: 'hj', url: 'http://hj.cjh.com.cn/', note: '汉江局19站' },
 ];
 
+// 6 号源：交通运输部官网「长江水位」每日公告（8/16 时各一期，29 站）
+// 补上长江委对外页没有的三峡库区段（长寿/涪陵/万州/秭归）——秭归·郭家坝就在巴东下游约50km
+// 注意：航道水位按当地航行基准面起算，与长江委站（绝对高程）基准不同，站对象标 src:'mot' 区分展示
+const MOT_LIST = 'https://www.mot.gov.cn/fuwu/yujingtishi/cjshuiweichaowei/';
+
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
 // 水势码 → 语义（水情信息编码 SL 330：5涨 4落 6平；其余视为未知）
 const trendOf = (wptn) => (wptn === '5' ? 'rise' : wptn === '4' ? 'fall' : wptn === '6' ? 'flat' : 'unk');
 
-async function fetchText(url) {
+async function fetchText(url, timeoutMs = 15000) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -32,6 +37,47 @@ async function fetchText(url) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** 站名 → 稳定伪站码（mot_ 前缀 + djb2 哈希），走势合并按 stcd 追踪 */
+function motId(name) {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) >>> 0;
+  return 'mot_' + h.toString(16);
+}
+
+/** 交通部每日长江水位表：列表页找最新「N时长江水位」文章 → 解析 站点/水位/涨落 三列表格 */
+async function fetchMot() {
+  const listHtml = await fetchText(MOT_LIST, 25000);
+  const m = listHtml.match(/href="(\.\/[^"]+\.html)"[\s\S]{0,160}?(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})时长江水位/);
+  if (!m) throw new Error('列表页没找到长江水位文章');
+  const artUrl = new URL(m[1], MOT_LIST).href;
+  const tm = Date.UTC(+m[2], +m[3] - 1, +m[4], +m[5] - 8, 0, 0); // 公告为北京时间 → epoch
+  const html = await fetchText(artUrl, 25000);
+  const rows = [];
+  const trRe = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>/g;
+  let t;
+  while ((t = trRe.exec(html))) {
+    const name = t[1].trim();
+    if (!name || name === '站点') continue;
+    const z = Number(t[2].trim());
+    if (!isFinite(z)) continue;
+    const d24 = Number(String(t[3].trim()).replace('+', '')); // 涨落 ±x.xx，0 记 0
+    rows.push({
+      stcd: motId(name),
+      stnm: name,
+      rvnm: '长江(航道)',
+      z: Math.round(z * 100) / 100,
+      q: 0,
+      tm,
+      w: !isFinite(d24) ? 'unk' : d24 > 0 ? 'rise' : d24 < 0 ? 'fall' : 'flat',
+      src: 'mot',
+      d24: isFinite(d24) ? Math.round(d24 * 100) / 100 : null,
+    });
+  }
+  if (!rows.length) throw new Error('文章里没解析到站点行');
+  console.log(`[ok] mot 交通部长江水位表 ${m[2]}-${m[3]}-${m[4]} ${m[5]}时 · ${rows.length} 站`);
+  return rows;
 }
 
 function parsePage(html) {
@@ -101,6 +147,31 @@ async function main() {
     })
   );
 
+  // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）
+  try {
+    const mot = await fetchMot();
+    const cjhNames = new Set();
+    for (const r of byStcd.values()) {
+      cjhNames.add(r.stnm.replace(/[(（].*/, ''));
+    }
+    let added = 0;
+    for (const r of mot) {
+      const prefix = r.stnm.replace(/[(（].*/, ''); // 重庆（寸滩）→ 重庆
+      const paren = (r.stnm.match(/[(（]([^)）]+)/) || [])[1] || ''; // → 寸滩
+      const dup = [...cjhNames].some((n) => (paren && n === paren) || (prefix.length >= 2 && (n === prefix || n.startsWith(prefix))));
+      if (dup) continue;
+      if (!byStcd.has(r.stcd)) {
+        byStcd.set(r.stcd, r);
+        added++;
+      }
+    }
+    sources.mot = `ok ${added}/${mot.length}条`;
+    console.log(`     mot 去重后新增 ${added} 站（其余与长江委重名跳过）`);
+  } catch (e) {
+    sources.mot = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] mot →', e.message);
+  }
+
   if (!byStcd.size) {
     console.error('全部数据源失败，保留旧文件');
     process.exit(1);
@@ -124,7 +195,19 @@ async function main() {
     h = h
       .filter(([t]) => t >= now - 26 * 3600e3 && !seen.has(t) && seen.add(t))
       .sort((a, b) => a[0] - b[0]);
-    const st = { stcd, stnm: r.stnm, rvnm: r.rvnm, z: r.z, q: r.q, tm: r.tm, w: r.w, d24: delta24(h, r.tm || now), h };
+    const st = {
+      stcd,
+      stnm: r.stnm,
+      rvnm: r.rvnm,
+      z: r.z,
+      q: r.q,
+      tm: r.tm,
+      w: r.w,
+      // mot 站的 24h 变幅直接用公告表的「涨落」列（官方口径）；长江委站由走势推算
+      d24: r.src === 'mot' && r.d24 != null ? r.d24 : delta24(h, r.tm || now),
+      src: r.src || 'cjh',
+      h,
+    };
     stations.push(st);
   }
   stations.sort((a, b) => (a.rvnm + a.stnm).localeCompare(b.rvnm + b.stnm, 'zh'));
