@@ -66,6 +66,20 @@ const SL_RIVERS = {
   江桥: '嫩江', 铁岭: '辽河', 沈阳: '浑河',
 };
 
+// 10 号源：太湖流域管理局「水文信息服务系统」后端接口（太湖流域 + 浙闽片，逐小时）
+// info.tbasw.cn 展示页是 miniui SPA，但后端裸 IP 直连明文 JSON、无鉴权（从页面 JS 逆向所得）
+// 站型含 河道/水库/潮位/闸坝——只收 河道+潮位+闸坝 且 z 非空的站（水库大多无水位值，诚实跳过）
+// 潮位站对河口/感潮河段钓鱼是独有价值；站对象标 src:'tba'，携带 wrz 警戒水位备用
+const TBA_BASE = 'http://58.247.45.108:8020/RegionalWaterAnalysis/getWA_WaterDay';
+// 11 号源：水利部「全国水雨情信息网」xxfb.mwr.cn（全国 ~2000 站，每日 8 时一期）
+// mapSearch 接口明文 JSON（网页渲染层的字体加密挡不住后端接口），经纬度为双重 Base64
+// 只收 stType=river 的站（水库 z 为空需逐站查详情，成本高先不做）；
+// 浙闽+太湖流域剔除（10 号源小时级更优）；无官方站码，用稳定 idNo 造伪码 mwr_ 前缀
+const MWR_API = 'http://xxfb.mwr.cn/hydroSearch/mapSearch';
+// 12 号源：山东省水文中心「实时雨水情」openapi（约 110 站，逐小时，带真实站码+坐标+水势码）
+// 覆盖海河流域漳卫系（卫运河/漳卫新河/马颊河/徒骇河）+ 淮河沂沭泗（沂河/沭河/泗河/南四湖）+ 大汶河/东平湖
+const SD_API = 'http://60.216.119.102:10086/sd-ww-api/openapi/water_info';
+
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
@@ -285,6 +299,143 @@ async function fetchSongliao() {
   return rows;
 }
 
+async function fetchPost(url, body, timeoutMs = 25000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const isJson = typeof body === 'string' && body.trim().startsWith('{');
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'User-Agent': UA,
+        'Content-Type': isJson ? 'application/json' : 'application/x-www-form-urlencoded',
+      },
+      body,
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 北京时「YYYY-MM-DD HH」字符串（太湖局接口的 stime 参数） */
+function bjHourStr(offsetH = 0) {
+  const d = new Date(Date.now() + (8 + offsetH) * 3600e3);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}`;
+}
+
+/** 太湖局接口：POST 表单 stime+sbsnm（TH 太湖流域 / ZM 浙闽片），收 河道/潮位/闸坝 且 z 非空的站 */
+async function fetchTaihu() {
+  const rows = [];
+  const sttpKeep = new Set(['河道', '潮位', '闸坝']);
+  const parseTm = (s) => {
+    const m = String(s || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2})/);
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, 0, 0) : 0;
+  };
+  for (const sbsnm of ['TH', 'ZM']) {
+    let arr = [];
+    // 报汛是逐站滚动的：当前整点只有几十站出数，上一整点才齐全——默认问上一整点
+    for (const off of [-1, 0]) {
+      try {
+        const txt = await fetchPost(TBA_BASE, `stime=${encodeURIComponent(bjHourStr(off))}&sbsnm=${sbsnm}`);
+        const j = JSON.parse(txt);
+        arr = (j.data || []).filter((s) => s && s.z != null && sttpKeep.has(s.sttp) && s.lgtd && s.lttd);
+        if (arr.length > 50) break;
+      } catch (e) {
+        if (off === 0) throw e;
+      }
+    }
+    for (const s of arr) {
+      const q = Number(s.q);
+      rows.push({
+        stcd: String(s.stcd),
+        stnm: String(s.stnm || s.stcd),
+        rvnm: String(s.dyrn || s.hnnm || s.bsnm || '太湖流域'),
+        z: Math.round(Number(s.z) * 100) / 100,
+        q: isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 0,
+        tm: parseTm(s.tm),
+        w: 'unk',
+        src: 'tba',
+        wrz: s.wrz != null && isFinite(Number(s.wrz)) && Number(s.wrz) > 0 ? Number(s.wrz) : null,
+        lgtd: Math.round(Number(s.lgtd) * 1e5) / 1e5,
+        lttd: Math.round(Number(s.lttd) * 1e5) / 1e5,
+      });
+    }
+  }
+  // 同站码去重（TH 与 ZM 不重叠，但防接口重复回包）
+  const by = new Map(rows.map((r) => [r.stcd, r]));
+  if (!by.size) throw new Error('两个片区都没抓到站');
+  console.log(`[ok] tba 太湖局水文（太湖流域+浙闽片）${by.size} 站`);
+  return [...by.values()];
+}
+
+/** 山东省水文中心 openapi：warnList+normalList 全收，z 非空且带坐标 */
+async function fetchShandong() {
+  const txt = await fetchText(SD_API, 25000);
+  const j = JSON.parse(txt);
+  const arr = [...((j.data && j.data.warnList) || []), ...((j.data && j.data.normalList) || [])];
+  const rows = [];
+  for (const s of arr) {
+    if (!s || !s.stcd || s.z == null || !s.lgtd || !s.lttd) continue;
+    const m = String(s.tmFull || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+    const q = Number(s.q);
+    rows.push({
+      stcd: String(s.stcd),
+      stnm: String(s.stnm || s.stcd),
+      rvnm: String(s.rvnm || '山东'),
+      z: Math.round(Number(s.z) * 100) / 100,
+      q: isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 0,
+      tm: m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0,
+      w: trendOf(String(s.wptn)),
+      src: 'sd',
+      lgtd: Math.round(Number(s.lgtd) * 1e5) / 1e5,
+      lttd: Math.round(Number(s.lttd) * 1e5) / 1e5,
+    });
+  }
+  if (!rows.length) throw new Error('接口没解析到站点');
+  console.log(`[ok] sd 山东省水文中心 ${rows.length} 站`);
+  return rows;
+}
+
+/** 水利部 xxfb mapSearch：全国河站（stType=river）每日 8 时；坐标双重 Base64，浙闽/太湖剔除（10 号源小时级更优） */
+async function fetchMwr() {
+  const txt = await fetchPost(MWR_API, '{}', 30000);
+  const j = JSON.parse(txt);
+  const arr = (j.result || []).filter((r) => r && r.stType === 'river' && r.z != null && r.lgtd && r.lttd);
+  const dec = (s) => {
+    try {
+      return Number(Buffer.from(Buffer.from(String(s), 'base64').toString('utf8'), 'base64').toString('utf8'));
+    } catch (e) {
+      return NaN;
+    }
+  };
+  const rows = [];
+  for (const r of arr) {
+    if (r.addvnm === '浙江' || r.addvnm === '福建' || /太湖/.test(r.bsnm || '')) continue;
+    const lgtd = dec(r.lgtd), lttd = dec(r.lttd);
+    if (!isFinite(lgtd) || !isFinite(lttd)) continue;
+    const m = String(r.tm || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+    rows.push({
+      stcd: 'mwr_' + r.idNo,
+      stnm: String(r.stnm || ''),
+      rvnm: String(r.rvnm || r.bsnm || '未知河流'),
+      z: Math.round(Number(r.z) * 100) / 100,
+      q: 0,
+      tm: m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0,
+      w: 'unk',
+      src: 'mwr',
+      lgtd: Math.round(lgtd * 1e5) / 1e5,
+      lttd: Math.round(lttd * 1e5) / 1e5,
+    });
+  }
+  if (!rows.length) throw new Error('接口没解析到站点');
+  console.log(`[ok] mwr 水利部全国水雨情 ${rows.length} 站（浙闽/太湖已剔除）`);
+  return rows;
+}
+
 function parsePage(html) {
   const m = html.match(/var sssq ?= ?(\[[\s\S]*?\]);/);
   if (!m) return null;
@@ -386,6 +537,34 @@ async function main() {
     console.log('[fail] sl →', e.message);
   }
 
+  // 10 号源：太湖局（独立容错；真实站码，与长江委重码站保留 tm 较新者）
+  try {
+    const tba = await fetchTaihu();
+    let added = 0;
+    for (const r of tba) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.tba = `ok ${added}/${tba.length}站`;
+  } catch (e) {
+    sources.tba = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] tba →', e.message);
+  }
+
+  // 12 号源：山东省水文中心（独立容错；真实站码，同码保留较新者）
+  try {
+    const sd = await fetchShandong();
+    let added = 0;
+    for (const r of sd) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.sd = `ok ${added}/${sd.length}站`;
+  } catch (e) {
+    sources.sd = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] sd →', e.message);
+  }
+
   // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）
   try {
     const mot = await fetchMot();
@@ -411,6 +590,27 @@ async function main() {
     console.log('[fail] mot →', e.message);
   }
 
+  // 11 号源：水利部全国水雨情（最后合入；伪码 mwr_ 不会撞站码，但站名去重必须做——
+  // 哈尔滨/梧州（四）/寸滩等站在松辽/珠江/长江委源里已有更优版本（小时级/带水势码））
+  try {
+    const mwr = await fetchMwr();
+    const norm = (n) => String(n).replace(/[(（].*$/, '').trim();
+    const names = new Set();
+    for (const r of byStcd.values()) names.add(norm(r.stnm));
+    let added = 0;
+    for (const r of mwr) {
+      if (names.has(norm(r.stnm))) continue;
+      byStcd.set(r.stcd, r);
+      names.add(norm(r.stnm));
+      added++;
+    }
+    sources.mwr = `ok ${added}/${mwr.length}站`;
+    console.log(`     mwr 去重后新增 ${added} 站（其余与既有源重名跳过）`);
+  } catch (e) {
+    sources.mwr = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] mwr →', e.message);
+  }
+
   if (!byStcd.size) {
     console.error('全部数据源失败，保留旧文件');
     process.exit(1);
@@ -429,11 +629,15 @@ async function main() {
     let h = Array.isArray(old && old.h) ? old.h.slice() : [];
     const lastT = h.length ? h[h.length - 1][0] : 0;
     if (r.tm && r.tm > lastT) h.push([r.tm, r.z]);
-    // 去重 + 只留近 26h
+    // 去重 + 只留近 26h + 降采样到 ≤10 点（小时级源上千站，全量走势会把文件撑爆；10 点算 24h 变幅够用）
     const seen = new Set();
     h = h
       .filter(([t]) => t >= now - 26 * 3600e3 && !seen.has(t) && seen.add(t))
       .sort((a, b) => a[0] - b[0]);
+    if (h.length > 10) {
+      const step = (h.length - 1) / 9;
+      h = Array.from({ length: 10 }, (_, i) => h[Math.round(i * step)]);
+    }
     const st = {
       stcd,
       stnm: r.stnm,
@@ -445,6 +649,8 @@ async function main() {
       // mot 站用公告「涨落」列、hb 站用页面序列自带的 24h 变幅（首次抓取即有）；长江委站由走势推算
       d24: r.d24 != null ? r.d24 : delta24(h, r.tm || now),
       src: r.src || 'cjh',
+      ...(r.lgtd != null ? { lgtd: r.lgtd, lttd: r.lttd } : {}),
+      ...(r.wrz != null ? { wrz: r.wrz } : {}),
       h,
     };
     stations.push(st);
@@ -470,6 +676,7 @@ async function main() {
   const size = Math.round(fs.statSync(DATA_FILE).size / 1024);
   const withD = stations.filter((s) => s.d24 != null).length;
   console.log(`写入 data/hydro.json：${stations.length} 站 · ${withD} 站有24h变幅 · ${size}KB`);
+  if (size > 700) console.log('::warning::文件超 700KB，真机加载变慢——考虑收紧采集范围或走势降采样更狠');
 }
 
 main();
