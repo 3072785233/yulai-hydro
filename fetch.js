@@ -479,6 +479,68 @@ async function fetchShandong() {
 }
 
 /** 水利部 xxfb mapSearch：全国河站（stType=river）每日 8 时；坐标双重 Base64，浙闽/太湖剔除（10 号源小时级更优） */
+// 14 号源：湖南省水文中心「一张图」后端（明文 JSON）。坑：站表 list 里的 MODITIME/Z 是登记旧值，
+// 实时逐时线在 process 接口（每站一次）——只拉 8 位中央报汛码老站（约 217 个，湘资沅澧+主要支流全覆盖），
+// H/F 码山洪小站价值低不拉；process 自带 26h 窗口历史，首跑即有完整走势
+const HN_LIST_API = 'http://58.20.42.94:9090/newapi/api/v1/ysq/river/list';
+const HN_PROC_API = 'http://58.20.42.94:9090/newapi/api/v1/ysq/river/process';
+
+async function fetchHunan() {
+  const win = { stm: bjHourStr(-26) + ':00:00', etm: bjHourStr(0) + ':00:00' };
+  const base = JSON.parse(await fetchPost(HN_LIST_API, JSON.stringify({ adcd: '430000', ...win, keyword: '' }), 30000));
+  const pool = ((base.data || {}).list || []).filter(
+    (s) => /^\d{8}$/.test(s.STCD1) && isFinite(Number(s.LGTD)) && isFinite(Number(s.LTTD))
+  );
+  if (pool.length < 50) throw new Error('站表异常：老码站只剩 ' + pool.length);
+  const parseTm = (s) => {
+    const m = String(s || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0;
+  };
+  const now = Date.now();
+  const rows = [];
+  let idx = 0;
+  const worker = async () => {
+    while (idx < pool.length) {
+      const s = pool[idx++];
+      try {
+        const j = JSON.parse(await fetchPost(HN_PROC_API, JSON.stringify({ stcd: s.STCD1, ...win }), 20000));
+        const list = ((j.data || {}).list || []).filter((p) => p && p.Z != null && isFinite(Number(p.Z)));
+        let meta = null, maxT = 0;
+        for (const p of list) {
+          const t = parseTm(p.TM);
+          if (t && t >= maxT) { maxT = t; meta = p; }
+        }
+        if (!meta || maxT < now - 30 * 3600e3) continue; // 窗口内没新数据的死站跳过
+        const pts = list
+          .map((p) => ({ t: parseTm(p.TM), z: Math.round(Number(p.Z) * 100) / 100 }))
+          .filter((p) => p.t && p.t >= now - 26 * 3600e3)
+          .sort((a, b) => a.t - b.t);
+        const last = pts[pts.length - 1];
+        const dz = pts.length >= 2 ? last.z - pts[pts.length - 2].z : NaN;
+        const wrz = Number(meta.WRZ), q = Number(meta.Q);
+        rows.push({
+          stcd: s.STCD1,
+          stnm: String(s.STNM || s.STCD1).trim(),
+          rvnm: String(meta.RVNM || s.RVNM || '').trim() || '湖南',
+          z: last.z,
+          q: isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 0,
+          tm: last.t,
+          w: !isFinite(dz) ? 'unk' : dz > 0.01 ? 'rise' : dz < -0.01 ? 'fall' : 'flat',
+          src: 'hn',
+          lgtd: Math.round(Number(s.LGTD) * 1e5) / 1e5,
+          lttd: Math.round(Number(s.LTTD) * 1e5) / 1e5,
+          ...(isFinite(wrz) ? { wrz: Math.round(wrz * 100) / 100 } : {}),
+          h: pts.map((p) => [p.t, p.z]),
+        });
+      } catch (e) { /* 单站失败不影响整源 */ }
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, worker));
+  if (rows.length < 50) throw new Error('逐时线只拉到 ' + rows.length + ' 站');
+  console.log(`[ok] hn 湖南水文一张图 ${rows.length}/${pool.length} 站`);
+  return rows;
+}
+
 async function fetchMwr() {
   const txt = await fetchPost(MWR_API, '{}', 45000);
   const j = JSON.parse(txt);
@@ -775,6 +837,21 @@ async function main() {
     console.log('[fail] mot →', e.message);
   }
 
+  // 14 号源：湖南水文一张图（真实中央报汛码，同码保留较新者；先于水利部合入——
+  // mwr 的湖南日报站按名去重自动让位给这套小时级数据）
+  try {
+    const hn = await fetchHunan();
+    let added = 0;
+    for (const r of hn) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.hn = `ok ${added}/${hn.length}站`;
+  } catch (e) {
+    sources.hn = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] hn →', e.message);
+  }
+
   // 11 号源：水利部全国水雨情（最后合入；伪码 mwr_ 不会撞站码，但站名去重必须做——
   // 哈尔滨/梧州（四）/寸滩等站在松辽/珠江/长江委源里已有更优版本（小时级/带水势码））
   try {
@@ -812,8 +889,8 @@ async function main() {
   for (const [stcd, r] of byStcd) {
     const old = prev && Array.isArray(prev.stations) ? prev.stations.find((x) => x.stcd === stcd) : null;
     let h = Array.isArray(old && old.h) ? old.h.slice() : [];
-    const lastT = h.length ? h[h.length - 1][0] : 0;
-    if (r.tm && r.tm > lastT) h.push([r.tm, r.z]);
+    if (Array.isArray(r.h)) h.push(...r.h); // hn 自带 26h 窗口逐时线，首跑即有完整走势
+    if (r.tm && r.z != null) h.push([r.tm, r.z]); // 时间戳重/超窗的由下方过滤统一清理
     // 去重 + 只留近 26h + 降采样到 ≤10 点（小时级源上千站，全量走势会把文件撑爆；10 点算 24h 变幅够用）
     const seen = new Set();
     h = h
