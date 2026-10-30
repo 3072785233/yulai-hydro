@@ -3,32 +3,47 @@
 // 用法：GITEE_TOKEN=xx GITEE_USER=xx GITEE_REPO=user/repo node mirror-gitee.js
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { GITEE_TOKEN: TOKEN, GITEE_USER: USER, GITEE_REPO: REPO } = process.env;
 if (!TOKEN || !USER || !REPO) {
   console.log('缺 Gitee 环境变量，跳过 API 镜像');
   process.exit(0);
 }
-const API = `https://gitee.com/api/v5/repos/${REPO}/contents/data/hydro.json`;
+
+// 本地文件的 git blob sha（与远端 content.sha 对得上说明没变，跳过不产生空提交）
+const blobSha = (buf) => crypto.createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
 
 (async () => {
-  const cur = await fetch(`${API}?ref=master&access_token=${TOKEN}`).then((r) => r.json());
-  if (!cur || !cur.sha) throw new Error('拿远端 sha 失败: ' + JSON.stringify(cur).slice(0, 120));
-  const buf = fs.readFileSync(path.join(__dirname, 'data', 'hydro.json'));
-  const put = await fetch(`${API}?access_token=${TOKEN}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      access_token: TOKEN,
-      content: buf.toString('base64'),
-      sha: cur.sha,
-      branch: 'master',
-      message: `hydro 镜像更新(API兜底) ${new Date().toISOString()}`,
-    }),
-  }).then((r) => r.json());
-  if (!put || !put.content) throw new Error('API 更新失败: ' + JSON.stringify(put).slice(0, 150));
-  console.log(`[ok] Gitee API 镜像成功 ${(put.content.sha || '').slice(0, 8)}`);
-})().catch((e) => {
-  console.error('[fail] mirror-gitee →', e.message);
-  process.exit(1);
-});
+  let failed = 0;
+  for (const file of ['data/hydro.json', 'data/tides.json']) {
+    try {
+      const local = fs.readFileSync(path.join(__dirname, file));
+      const api = `https://gitee.com/api/v5/repos/${REPO}/contents/${file}`;
+      const cur = await fetch(`${api}?ref=master&access_token=${TOKEN}`).then((r) => r.json());
+      const remoteSha = cur && cur.sha && !cur.message ? cur.sha : null; // 404（文件还没有）= 新建
+      if (remoteSha === blobSha(local)) {
+        console.log(`[skip] ${file} 远端已是最新`);
+        continue;
+      }
+      const body = {
+        access_token: TOKEN,
+        content: local.toString('base64'),
+        branch: 'master',
+        message: `${file} 镜像更新(API兜底) ${new Date().toISOString()}`,
+      };
+      if (remoteSha) body.sha = remoteSha;
+      const put = await fetch(`${api}?access_token=${TOKEN}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then((r) => r.json());
+      if (!put || !put.content) throw new Error('API 更新失败: ' + JSON.stringify(put).slice(0, 150));
+      console.log(`[ok] Gitee API 镜像成功 ${file} ${(put.content.sha || '').slice(0, 8)}`);
+    } catch (e) {
+      failed++;
+      console.error(`[fail] mirror-gitee ${file} →`, e.message);
+    }
+  }
+  if (failed) process.exit(1);
+})();

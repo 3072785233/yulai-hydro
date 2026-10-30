@@ -79,8 +79,79 @@ const MWR_API = 'http://xxfb.mwr.cn/hydroSearch/mapSearch';
 // 12 号源：山东省水文中心「实时雨水情」openapi（约 110 站，逐小时，带真实站码+坐标+水势码）
 // 覆盖海河流域漳卫系（卫运河/漳卫新河/马颊河/徒骇河）+ 淮河沂沭泗（沂河/沭河/泗河/南四湖）+ 大汶河/东平湖
 const SD_API = 'http://60.216.119.102:10086/sd-ww-api/openapi/water_info';
+// 13 号源：长江航道局「水位公告」（cjhdj.com.cn，每日 8/16 时两期，37 行 = 29 水位站 + 8 流量行）
+// 这是交通部公告的上游源头（站更多、带涨落列）；三峡库区段为绝对高程（~173m），其余当地航行基面——卡上注明看涨落
+// 流量行（向家坝入库 4300 这类）z>200 一律滤掉；坐标按港口/码头人工标注（≈ 为码头级精度）
+const HDJ_LIST = 'https://www.cjhdj.com.cn/hdfw/sw/';
+const HDJ_COORDS = {
+  '宜宾（合江门）': [28.77, 106.64], '江安（白沙湾）': [28.43, 105.07], '泸州（麻沙桥）': [28.88, 105.44],
+  '朱沱（汉东村）': [29.05, 105.85], '江津（猪圈门）': [29.29, 106.26], '重庆（寸滩）': [29.57, 106.6],
+  '长寿（小石溪）': [29.86, 107.08], '涪陵（白鹤梁）': [29.7, 107.4], '万州（红花地）': [30.81, 108.41],
+  '秭归（郭家坝）': [30.96, 110.78], '宜昌（中水门）': [30.68, 111.29], '车阳河（关洲）': [30.5, 111.7],
+  '枝江（李家渡）': [30.42, 111.75], '沙市（杨林矶）': [30.33, 112.24], '郝穴（航道码头）': [30.34, 112.42],
+  '石首（航道码头）': [29.73, 112.42], '监利（泳协码头）': [29.82, 112.9], '城陵矶（岳阳关）': [29.42, 113.13],
+  '莫家河（嘉鱼大桥）': [29.98, 113.87], '汉口（武汉关）': [30.55, 114.29], '黄石（黄石大桥）': [30.25, 115.04],
+  '九江（航道码头）': [29.73, 116.0], '安庆（马窝）': [30.51, 117.05], '铜陵（外贸码头）': [30.95, 117.7],
+  '芜湖（芜湖大桥）': [31.35, 118.38], '南京（下关）': [32.09, 118.73], '镇江（定易洲）': [32.22, 119.42],
+  丹华港: [32.16, 119.85], '嘉陵江（北碚）': [29.8, 106.44], 湘江长沙: [28.2, 112.97],
+};
+const HDJ_RIVERS = { '嘉陵江（北碚）': '嘉陵江(航道)', 湘江长沙: '湘江(航道)' };
+
+// 潮汐表：chaoxibiao.net 每港一页 /tides/{id}.html，页内 showTides("日期","key","zlib-base64")
+// inflate 出当日 24 个整点潮高（cm，天文预报值非实测）。全站 500 港，精选 ~85 个钓鱼相关港并人工标注坐标（≈ 为港口级精度）
+// 潮高为预报值且每日一更：tides.json 带日期，同日跳过抓取（小时级流水线里只白嫖一次）
+const TIDE_BASE = 'https://www.chaoxibiao.net/tides/';
+const TIDE_PORTS = [
+  // 辽宁
+  [191, '丹东港', 39.9, 124.2], [238, '鸭绿江口', 39.85, 124.2], [224, '大连', 38.87, 121.55],
+  [185, '旅顺新港', 38.75, 121.2], [207, '金石滩', 39.09, 121.97], [187, '小长山岛', 39.28, 122.7],
+  [188, '大鹿岛', 39.75, 123.85], [180, '营口', 40.67, 122.2], [181, '鲅鱼圈', 40.27, 122.13],
+  [259, '盘锦红海滩', 40.85, 121.8], [178, '笔架山', 40.78, 121.35], [183, '葫芦岛', 40.7, 120.95],
+  [174, '芷锚湾', 40.05, 119.85],
+  // 河北·天津
+  [172, '秦皇岛', 39.9, 119.6], [373, '鸽子窝', 39.84, 119.5], [170, '京唐港', 39.2, 119.0],
+  [169, '曹妃甸', 38.95, 118.45], [168, '塘沽', 38.98, 117.78], [165, '黄骅港', 38.35, 117.85],
+  // 山东
+  [162, '东营港', 38.05, 119.15], [161, '潍坊港', 37.15, 119.2], [160, '莱州港', 37.4, 119.95],
+  [159, '龙口', 37.65, 120.3], [158, '蓬莱', 37.83, 120.75], [331, '长岛', 37.93, 120.73],
+  [3, '烟台', 37.55, 121.4], [5, '成山头', 37.4, 122.7], [4, '威海', 37.5, 122.12],
+  [6, '石岛', 36.88, 122.42], [8, '乳山口', 36.8, 121.55], [11, '青岛', 36.07, 120.35],
+  [301, '石老人', 36.08, 120.47], [13, '董家口', 35.6, 119.8], [14, '日照港', 35.38, 119.55],
+  [15, '岚山港', 35.2, 119.35],
+  // 江苏·上海
+  [16, '连云港', 34.75, 119.45], [18, '滨海港', 34.25, 120.3], [19, '射阳河口', 33.85, 120.45],
+  [21, '大丰港', 33.2, 120.75], [22, '弶港', 32.75, 120.9], [23, '洋口港', 32.55, 121.4],
+  [24, '吕四', 32.05, 121.6], [25, '天生港', 32.05, 120.85], [347, '吴淞', 31.4, 121.5],
+  [27, '崇明', 31.6, 121.6], [31, '芦潮港', 30.87, 121.9], [32, '金山嘴', 30.75, 121.35],
+  // 浙江
+  [36, '乍浦', 30.6, 121.1], [48, '北仑港', 29.9, 121.85], [44, '定海', 30.0, 122.1],
+  [43, '沈家门', 29.95, 122.3], [41, '岱山', 30.25, 122.2], [417, '嵊泗', 30.75, 122.45],
+  [35, '嵊山', 30.85, 122.8], [52, '石浦', 29.2, 121.95], [57, '海门（台州）', 28.68, 121.55],
+  [431, '石塘', 28.3, 121.65], [60, '坎门', 28.05, 121.35], [62, '温州', 27.95, 120.7],
+  [434, '洞头', 27.85, 121.15], [438, '渔寮', 27.4, 120.5],
+  // 福建
+  [440, '沙埕', 27.2, 120.3], [65, '三沙（霞浦）', 26.9, 120.2], [76, '平潭', 25.5, 119.8],
+  [70, '马尾', 25.98, 119.45], [80, '崇武', 24.9, 118.9], [82, '泉州', 24.85, 118.65],
+  [84, '围头', 24.55, 118.6], [86, '厦门', 24.45, 118.07], [89, '东山', 23.7, 117.5],
+  // 广东
+  [459, '饶平', 23.7, 116.95], [90, '南澳岛（云澳）', 23.4, 117.1], [92, '汕头', 23.35, 116.75],
+  [95, '汕尾', 22.78, 115.35], [465, '遮浪', 22.65, 115.5], [98, '大亚湾', 22.7, 114.7],
+  [99, '大鹏湾', 22.55, 114.3], [100, '蛇口', 22.48, 113.9], [346, '广州', 23.1, 113.3],
+  [111, '珠海（九洲港）', 22.25, 113.55], [477, '高栏', 21.9, 113.2], [119, '上川岛', 21.75, 112.8],
+  [502, '闸坡（海陵岛）', 21.6, 111.9], [123, '博贺', 21.35, 111.35], [127, '湛江', 21.2, 110.4],
+  [126, '硇洲岛', 20.9, 110.6], [130, '流沙', 20.4, 110.15], [129, '海安', 20.25, 110.2],
+  // 广西
+  [151, '北海', 21.48, 109.08], [150, '涠洲岛', 21.05, 109.1], [482, '钦州', 21.95, 108.65],
+  [155, '防城港', 21.7, 108.35],
+  // 海南·港澳
+  [134, '海口', 20.05, 110.3], [143, '洋浦', 19.75, 109.2], [136, '清澜（文昌）', 19.55, 110.8],
+  [137, '博鳌', 19.25, 110.6], [142, '东方', 19.1, 108.65], [141, '莺歌海', 18.5, 108.7],
+  [138, '新村（陵水）', 18.45, 110.0], [140, '三亚', 18.25, 109.5], [349, '香港', 22.28, 114.15],
+  [348, '澳门', 22.15, 113.55],
+];
 
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
+const TIDE_FILE = path.join(__dirname, 'data', 'tides.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
 // 水势码 → 语义（水情信息编码 SL 330：5涨 4落 6平；其余视为未知）
@@ -218,6 +289,13 @@ async function fetchHubei() {
   if (!rows.length) throw new Error('45 站全军覆没（平台可能又在 500）');
   console.log(`[ok] hb 湖北省水情平台 ${okN}/${HB_STATIONS.length} 站`);
   return rows;
+}
+
+/** 站名 → 稳定伪站码（hdj_ 前缀 + djb2 哈希），沿用 mot 的做法 */
+function hdjId(name) {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) >>> 0;
+  return 'hdj_' + h.toString(16);
 }
 
 /** 站名 → 稳定伪站码（zj_ 前缀 + djb2 哈希），沿用 mot 的做法 */
@@ -402,7 +480,7 @@ async function fetchShandong() {
 
 /** 水利部 xxfb mapSearch：全国河站（stType=river）每日 8 时；坐标双重 Base64，浙闽/太湖剔除（10 号源小时级更优） */
 async function fetchMwr() {
-  const txt = await fetchPost(MWR_API, '{}', 30000);
+  const txt = await fetchPost(MWR_API, '{}', 45000);
   const j = JSON.parse(txt);
   const arr = (j.result || []).filter((r) => r && r.stType === 'river' && r.z != null && r.lgtd && r.lttd);
   const dec = (s) => {
@@ -434,6 +512,90 @@ async function fetchMwr() {
   if (!rows.length) throw new Error('接口没解析到站点');
   console.log(`[ok] mwr 水利部全国水雨情 ${rows.length} 站（浙闽/太湖已剔除）`);
   return rows;
+}
+
+/** 长江航道局水位公告：列表页找最新「N日N时水位」文章 → 站点/水位/涨落 三列表格（流量行按 z>200 滤掉） */
+async function fetchCjhdj() {
+  const listHtml = await fetchText(HDJ_LIST, 25000);
+  const m = listHtml.match(/href="(\.\/[^"]+\.shtml)"[\s\S]{0,160}?(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})时水位/);
+  if (!m) throw new Error('列表页没找到水位文章');
+  const artUrl = new URL(m[1], HDJ_LIST).href;
+  const tm = Date.UTC(+m[2], +m[3] - 1, +m[4], +m[5] - 8, 0, 0);
+  const html = await fetchText(artUrl, 25000);
+  const rows = [];
+  const trRe = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>/g;
+  let t;
+  while ((t = trRe.exec(html))) {
+    const name = t[1].trim();
+    if (!name || name === '站点') continue;
+    const z = Number(t[2].trim());
+    const d24 = Number(String(t[3].trim()).replace('+', ''));
+    if (!isFinite(z) || z > 200) continue; // 向家坝入库 4300 这类流量行不是水位
+    const coord = HDJ_COORDS[name];
+    rows.push({
+      stcd: hdjId(name),
+      stnm: name,
+      rvnm: HDJ_RIVERS[name] || '长江(航道)',
+      z: Math.round(z * 100) / 100,
+      q: 0,
+      tm,
+      w: !isFinite(d24) ? 'unk' : d24 > 0 ? 'rise' : d24 < 0 ? 'fall' : 'flat',
+      src: 'hdj',
+      d24: isFinite(d24) ? Math.round(d24 * 100) / 100 : null,
+      ...(coord ? { lttd: coord[0], lgtd: coord[1] } : {}),
+    });
+  }
+  if (!rows.length) throw new Error('文章里没解析到站点行');
+  console.log(`[ok] hdj 长江航道局水位 ${m[2]}-${m[3]}-${m[4]} ${m[5]}时 · ${rows.length} 站`);
+  return rows;
+}
+
+/** 潮汐表：逐港抓页 → showTides 三参 → zlib inflate 出 24 整点潮高（cm）。
+ *  每日一更：tides.json 的 date 与今日（北京时）相同则整段跳过，别对人家站点一小时打 85 发 */
+async function fetchTides() {
+  const bj = new Date(Date.now() + 8 * 3600e3);
+  const p2 = (x) => String(x).padStart(2, '0');
+  const today = `${bj.getUTCFullYear()}-${p2(bj.getUTCMonth() + 1)}-${p2(bj.getUTCDate())}`;
+  try {
+    const prev = JSON.parse(fs.readFileSync(TIDE_FILE, 'utf8'));
+    if (prev.date === today && Array.isArray(prev.ports) && prev.ports.length >= 60) {
+      console.log(`[skip] tides 今日（${today}）已抓过 ${prev.ports.length} 港，跳过`);
+      return;
+    }
+  } catch (e) { /* 首次 */ }
+
+  const zlib = require('zlib');
+  const CONC = 8;
+  const ports = [];
+  let failN = 0;
+  for (let i = 0; i < TIDE_PORTS.length; i += CONC) {
+    await Promise.all(
+      TIDE_PORTS.slice(i, i + CONC).map(async ([id, name, lttd, lgtd]) => {
+        try {
+          const html = await fetchText(TIDE_BASE + id + '.html', 20000);
+          const seg = html.match(/showTides\(([\s\S]{0,1600}?)\);/);
+          if (!seg) throw new Error('没有 showTides');
+          const strs = [...seg[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+          const b64s = strs.filter((s) => s.length > 40 && /^[A-Za-z0-9+/=]+$/.test(s));
+          if (!b64s.length) throw new Error('没有 base64 段');
+          const vals = zlib
+            .inflateSync(Buffer.from(b64s.join(''), 'base64'))
+            .toString()
+            .split(',')
+            .map((v) => Math.round(Number(v)));
+          if (vals.length !== 24 || vals.some((v) => !isFinite(v))) throw new Error('不是 24 个潮高值');
+          ports.push({ id: String(id), name, lttd, lgtd, h: vals });
+        } catch (e) {
+          failN++;
+        }
+      })
+    );
+  }
+  if (ports.length < 10) throw new Error(`只抓到 ${ports.length} 港`);
+  const out = { v: 1, date: today, updated: new Date().toISOString(), ports };
+  fs.writeFileSync(TIDE_FILE, JSON.stringify(out));
+  const size = Math.round(fs.statSync(TIDE_FILE).size / 1024);
+  console.log(`[ok] tides 潮汐表 ${ports.length}/${TIDE_PORTS.length} 港 · ${today} · ${size}KB${failN ? `（${failN} 港失败）` : ''}`);
 }
 
 function parsePage(html) {
@@ -565,6 +727,29 @@ async function main() {
     console.log('[fail] sd →', e.message);
   }
 
+  // 13 号源：长江航道局水位公告（先于交通部合入：它是交通部公告的上游源头，站更多且带涨落列；
+  // 与长江委/湖北重名站（寸滩/宜昌/汉口…）跳过——水文口径小时级更优）
+  try {
+    const hdj = await fetchCjhdj();
+    const names = new Set();
+    for (const r of byStcd.values()) names.add(r.stnm.replace(/[(（].*/, ''));
+    let added = 0;
+    for (const r of hdj) {
+      const prefix = r.stnm.replace(/[(（].*/, '');
+      const paren = (r.stnm.match(/[(（]([^)）]+)/) || [])[1] || '';
+      const dup = [...names].some((n) => (paren && n === paren) || (prefix.length >= 2 && (n === prefix || n.startsWith(prefix))));
+      if (dup) continue;
+      byStcd.set(r.stcd, r);
+      names.add(prefix);
+      added++;
+    }
+    sources.hdj = `ok ${added}/${hdj.length}站`;
+    console.log(`     hdj 去重后新增 ${added} 站（其余与长江委/湖北重名跳过）`);
+  } catch (e) {
+    sources.hdj = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] hdj →', e.message);
+  }
+
   // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）
   try {
     const mot = await fetchMot();
@@ -677,6 +862,13 @@ async function main() {
   const withD = stations.filter((s) => s.d24 != null).length;
   console.log(`写入 data/hydro.json：${stations.length} 站 · ${withD} 站有24h变幅 · ${size}KB`);
   if (size > 700) console.log('::warning::文件超 700KB，真机加载变慢——考虑收紧采集范围或走势降采样更狠');
+
+  // 潮汐表（独立于水情：它挂了水情照常，反之亦然）
+  try {
+    await fetchTides();
+  } catch (e) {
+    console.log('[fail] tides →', e.message);
+  }
 }
 
 main();
