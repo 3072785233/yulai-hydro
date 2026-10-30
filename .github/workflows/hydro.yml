@@ -41,7 +41,13 @@ jobs:
             echo "Gitee secrets 未配置，跳过同步（配置方法见 SETUP.md）"; exit 0
           fi
           git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" || true
-          git push -f gitee HEAD:master
+          # git 推送被 Gitee 拒（数据中心 IP 偶发被拦）→ 自动降级 API 直写数据文件
+          if git push -f gitee HEAD:master; then
+            echo "git 镜像成功"
+          else
+            echo "::warning::git 推送被拒，改走 API 兜底"
+            node mirror-gitee.js
+          fi
       - name: 刷新 jsDelivr CDN 缓存（免认证，让备用地址也保持新鲜）
         run: |
           sleep 10
