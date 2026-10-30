@@ -340,7 +340,7 @@ async function fetchTaihu() {
     // 报汛是逐站滚动的：当前整点只有几十站出数，上一整点才齐全——默认问上一整点
     for (const off of [-1, 0]) {
       try {
-        const txt = await fetchPost(TBA_BASE, `stime=${encodeURIComponent(bjHourStr(off))}&sbsnm=${sbsnm}`);
+        const txt = await fetchPost(TBA_BASE, `stime=${encodeURIComponent(bjHourStr(off))}&sbsnm=${sbsnm}`, 40000);
         const j = JSON.parse(txt);
         arr = (j.data || []).filter((s) => s && s.z != null && sttpKeep.has(s.sttp) && s.lgtd && s.lttd);
         if (arr.length > 50) break;
