@@ -32,12 +32,22 @@ const blobSha = (buf) => crypto.createHash('sha1').update(`blob ${buf.length}\0`
         branch: 'master',
         message: `${file} 镜像更新(API兜底) ${new Date().toISOString()}`,
       };
-      if (remoteSha) body.sha = remoteSha;
-      const put = await fetch(`${api}?access_token=${TOKEN}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
+      let put;
+      if (remoteSha) {
+        // 已有文件：PUT 带 sha 更新
+        put = await fetch(`${api}?access_token=${TOKEN}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, sha: remoteSha }),
+        }).then((r) => r.json());
+      } else {
+        // 新文件：Gitee 与 GitHub 不同——PUT 必须带 sha，新建要 POST 到带路径的端点（POST /contents/{path}）
+        put = await fetch(`${api}?access_token=${TOKEN}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...body, path: file }),
+        }).then((r) => r.json());
+      }
       if (!put || !put.content) throw new Error('API 更新失败: ' + JSON.stringify(put).slice(0, 150));
       console.log(`[ok] Gitee API 镜像成功 ${file} ${(put.content.sha || '').slice(0, 8)}`);
     } catch (e) {
