@@ -56,6 +56,16 @@ const ZJ_RIVERS = {
   高要: '西江', 石角: '北江', 柳州: '柳江', 武宣: '黔江', 迁江: '红水河',
 };
 
+// 9 号源：松辽委「实时水情」（松花江/嫩江/辽河干流 6 站，每日 8 时）
+// slwr.gov.cn 明文 JSON 接口无反爬（从 sssq.jhtml 页面 JS 逆向所得）；站码为全国统一水文编码
+// 注意：各站水位为当地（冻结）基面，非绝对高程——看涨落与流量更直观，站对象标 src:'sl' 区分展示
+const SL_API = 'http://www.slwr.gov.cn/slwSQ/api/sq-list';
+// 站名 → 河名（接口不带河名；全部 6 站显式标，未来新增站兜底「松辽流域」不硬编）
+const SL_RIVERS = {
+  哈尔滨: '松花江', 宁江: '松花江', 大赉: '松花江',
+  江桥: '嫩江', 铁岭: '辽河', 沈阳: '浑河',
+};
+
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
@@ -240,6 +250,41 @@ async function fetchZhujiang() {
   return rows;
 }
 
+/** 松辽委实时水情：明文 JSON，报汛时间「30日08时」按北京时解析（跨月自动归上个月） */
+async function fetchSongliao() {
+  const json = JSON.parse(await fetchText(SL_API, 25000));
+  const arr = Array.isArray(json.data) ? json.data : [];
+  const bj = new Date(Date.now() + 8 * 3600e3);
+  const y = bj.getUTCFullYear(), mo = bj.getUTCMonth() + 1, day0 = bj.getUTCDate();
+  const rows = [];
+  for (const it of arr) {
+    if (!it || !it.stcd || it.z == null) continue;
+    const tmM = String(it.tm || '').match(/(\d{1,2})日(\d{1,2})时/);
+    if (!tmM) continue;
+    const day = +tmM[1], hh = +tmM[2];
+    let yy = y, mm = mo;
+    if (day > day0) { // 月初还挂着上月末的公告 → 归上个月
+      mm -= 1;
+      if (mm === 0) { mm = 12; yy -= 1; }
+    }
+    const z = Number(it.z), q = Number(it.q);
+    if (!isFinite(z)) continue;
+    rows.push({
+      stcd: String(it.stcd),
+      stnm: String(it.stnm || it.stcd),
+      rvnm: SL_RIVERS[it.stnm] || '松辽流域',
+      z: Math.round(z * 100) / 100,
+      q: isFinite(q) ? Math.round(q * 100) / 100 : 0,
+      tm: Date.UTC(yy, mm - 1, day, hh - 8, 0, 0),
+      w: trendOf(String(it.wptn)),
+      src: 'sl',
+    });
+  }
+  if (!rows.length) throw new Error('接口没解析到站点');
+  console.log(`[ok] sl 松辽委水情 ${rows.length} 站`);
+  return rows;
+}
+
 function parsePage(html) {
   const m = html.match(/var sssq ?= ?(\[[\s\S]*?\]);/);
   if (!m) return null;
@@ -329,6 +374,16 @@ async function main() {
   } catch (e) {
     sources.zj = 'fail ' + String(e.message || e).slice(0, 40);
     console.log('[fail] zj →', e.message);
+  }
+
+  // 9 号源：松辽委水情（独立容错；松花江/嫩江/辽河首批站，全部为新增）
+  try {
+    const sl = await fetchSongliao();
+    for (const r of sl) byStcd.set(r.stcd, r);
+    sources.sl = `ok ${sl.length}站`;
+  } catch (e) {
+    sources.sl = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] sl →', e.message);
   }
 
   // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）

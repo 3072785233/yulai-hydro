@@ -32,7 +32,7 @@ github.com/<你>/yulai-hydro ──自动强推──▶ gitee.com/<你>/yulai-h
 |---|---|
 | 手动立刻刷新数据 | GitHub 仓库 → Actions → hydro → Run workflow |
 | 看数据新不新 | 打开 `https://gitee.com/<你>/yulai-hydro/raw/master/data/hydro.json`，看 `updated` 字段和 `sources` |
-| 加/改抓取源 | 改 `fetch.js` 里的 `SOURCES`（站码 stcd 全流域唯一，自动去重）；另有 6 号源 `fetchMot()`（交通运输部每日长江水位表，8/16 时各一期，站对象标 `src:'mot'`、伪站码 `mot_*`，与长江委重名站自动跳过，水位为当地航行基准面非绝对高程）、7 号源 `fetchHubei()`（湖北省水情平台 45 站单站页，`src:'hb'`、逐小时实测，全国统一站码与长江委自动去重；该平台走 http、并发>3 会甩 413，短时被封也不怕——断源 48h 内的站会沿用上轮读数保留在数据里） |
+| 加/改抓取源 | 改 `fetch.js` 里的 `SOURCES`（站码 stcd 全流域唯一，自动去重）；另有 6 号源 `fetchMot()`（交通运输部每日长江水位表，8/16 时各一期，站对象标 `src:'mot'`、伪站码 `mot_*`，与长江委重名站自动跳过，水位为当地航行基准面非绝对高程）、7 号源 `fetchHubei()`（湖北省水情平台 45 站单站页，`src:'hb'`、逐小时实测，全国统一站码与长江委自动去重；该平台走 http、并发>3 会甩 413，短时被封也不怕——断源 48h 内的站会沿用上轮读数保留在数据里）、8 号源 `fetchZhujiang()`（交通部珠江水情公告，`src:'zj'`、伪站码 `zj_*`，部分站当地基面）、9 号源 `fetchSongliao()`（松辽委明文 JSON 接口，`src:'sl'`，松花江/嫩江/辽河/浑河 6 站，各站当地冻结基面；报汛时间「30日08时」按北京时解析、跨月自动归上个月） |
 | 某个源挂了 | 不用管，`sources` 里标 fail，其余源照常；全挂了 Actions 会红牌提醒 |
 | 换抓取频率 | 改 `.github/workflows/hydro.yml` 里的 `cron` |
 | Gitee 同步失败 | 工作流自带双通道：git 推送被拒会自动降级 API 直写（`mirror-gitee.js`，令牌走 Secrets 不入库）；两条都挂才检查 secrets 是否过期，去 Gitee 重新生成并更新 GitHub 仓库 Settings → Secrets |
