@@ -601,6 +601,101 @@ async function fetchHunanRsvr() {
   return rows;
 }
 
+// 15 号源：江西省水雨情平台（省水利厅官网「江河水情」iframe 真身，GET 明文 JSON 无鉴权）。
+// 河道 26 重点站（带流量/警戒/距警戒，全部到乡镇级 county）+ 大中型水库 32（带库水位/入库出库/蓄量/汛限）。
+// 坑：站表不带坐标——先拿水利部 mapSearch 按站名 join，join 不上的查 JX_COORDS 人工表
+// （坐标按 county 镇名标注，±2-3km，就近匹配够用；拿不准的中小水库直接跳过不收）
+// 水库 q 不标（入库 inq/出库 otq 语义与河道断面流量不同，V2 做水库专属卡再展示）；汛限与「警戒」语义不同不带 wrz
+const JX_RIVER_API = 'https://slt-syq.jxwrd.gov.cn:7080/syq/rivermap/riverMapHandler';
+const JX_RSVR_API = 'https://slt-syq.jxwrd.gov.cn:7080/syq/reservoirmap/reservoirMapHandler';
+const JX_COORDS = {
+  // 河道（mapSearch join 不上的 7 个，坐标依 county 镇名）
+  翰林桥: [25.97, 115.05], // 赣县吉埠镇·平江
+  '渡峰坑(二)': [29.28, 117.17], // 景德镇昌江区·昌江
+  '峡山(二)': [25.98, 115.13], // 赣县江口镇·贡水
+  '信丰(二）': [25.39, 114.93], // 信丰嘉定镇·桃江（源站名括号是全角！）
+  '上饶(三)': [28.43, 117.94], // 上饶信州区·信江
+  娄家村: [27.98, 116.33], // 抚州临川抚北镇·抚河
+  新干: [27.77, 115.39], // 新干金川镇·赣江
+  // 水库大库（人工标注；柘林/江口/廖坊/龙潭/共库走 mapSearch join）
+  万安: [26.47, 114.67], // 赣江·万安枢纽
+  峡江坝上: [27.58, 115.16], // 赣江·峡江枢纽
+  上犹江: [25.82, 114.57], // 陡水湖
+  洪门: [27.53, 116.68], // 黎滩河
+  长冈: [26.34, 115.37], // 兴国
+  社上: [27.39, 114.63], // 安福·泸水
+  石虎塘: [26.85, 114.88], // 赣江·航电枢纽
+  白云山: [26.92, 115.31], // 青原
+  老营盘: [26.63, 115.06], // 泰和
+  大坳: [28.07, 117.71], // 上饶
+  飞剑潭: [27.86, 114.22], // 宜春袁州
+};
+
+async function fetchJiangxi() {
+  const dec2 = (s) => {
+    try {
+      return Number(Buffer.from(Buffer.from(String(s), 'base64').toString('utf8'), 'base64').toString('utf8'));
+    } catch (e) {
+      return NaN;
+    }
+  };
+  // 坐标池：水利部 mapSearch（全量含江西站+双 base64 坐标）+ 人工表
+  let mwrGeo = {};
+  try {
+    const mj = JSON.parse(await fetchPost(MWR_API, '{}', 45000));
+    for (const r of mj.result || []) {
+      const lgtd = dec2(r.lgtd), lttd = dec2(r.lttd);
+      if (isFinite(lgtd) && isFinite(lttd)) mwrGeo[String(r.stnm || '').replace(/[（(].*$/, '')] = [lttd, lgtd];
+    }
+  } catch (e) { /* join 池挂了靠人工表 */ }
+  const geoOf = (name) => mwrGeo[String(name).replace(/[（(].*$/, '')] || JX_COORDS[name];
+
+  // 江西时间「10月30日 14点40分」→ 北京时 epoch（12 月初见到 12 月的月初回退一年）
+  const bj = new Date(Date.now() + 8 * 3600e3);
+  const now = Date.now();
+  const parseJxTm = (s) => {
+    const m = String(s || '').match(/(\d{1,2})月(\d{1,2})日\s*(\d{1,2})点(\d{1,2})?分?/);
+    if (!m) return 0;
+    let yy = bj.getUTCFullYear();
+    if (+m[1] > bj.getUTCMonth() + 1) yy -= 1; // 1 月数据挂在 12 月跑 → 归去年
+    return Date.UTC(yy, +m[1] - 1, +m[2], +m[3] - 8, +(m[4] || 0), 0);
+  };
+
+  const rows = [];
+  const [riv, rsvr] = await Promise.all([
+    fetch(JX_RIVER_API, { headers: { 'User-Agent': UA } }).then((r) => r.json()),
+    fetch(JX_RSVR_API, { headers: { 'User-Agent': UA } }).then((r) => r.json()),
+  ]);
+  let rsvrKept = 0;
+  for (const p of [[riv, true], [rsvr, false]]) {
+    for (const r of (((p[0] || {}).data || {}).rows) || []) {
+      const tm = parseJxTm(r.tm);
+      const z = Number(p[1] ? r.z : r.rz);
+      if (!tm || now - tm > 30 * 3600e3 || !isFinite(z)) continue; // 汉口这类参照站挂着旧数据
+      const geo = geoOf(r.stnm);
+      if (!geo) continue; // 没坐标的中小水库跳过
+      const q = Number(r.q);
+      rows.push({
+        stcd: String(r.stcd),
+        stnm: String(r.stnm).trim(),
+        rvnm: String(r.bsnm || '').trim() || '江西',
+        z: Math.round(z * 100) / 100,
+        q: p[1] && isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 0,
+        tm,
+        w: trendOf(String(r.wptn)), // 江西水势列多为「—」，涨落靠 h 走势积累
+        ...(p[1] && isFinite(Number(r.wrz)) ? { wrz: Math.round(Number(r.wrz) * 100) / 100 } : {}),
+        src: 'jx',
+        lgtd: Math.round(geo[1] * 1e5) / 1e5,
+        lttd: Math.round(geo[0] * 1e5) / 1e5,
+      });
+      if (!p[1]) rsvrKept++;
+    }
+  }
+  if (rows.length < 20) throw new Error('只解析到 ' + rows.length + ' 站');
+  console.log(`[ok] jx 江西水雨情 ${rows.length} 站（河道+水库${rsvrKept}，坐标 mapSearch join+人工表）`);
+  return rows;
+}
+
 async function fetchMwr() {
   const txt = await fetchPost(MWR_API, '{}', 45000);
   const j = JSON.parse(txt);
@@ -926,6 +1021,21 @@ async function main() {
   } catch (e) {
     sources.hn = 'fail ' + String(e.message || e).slice(0, 40);
     console.log('[fail] hn →', e.message);
+  }
+
+  // 15 号源：江西水雨情（真实站码，与长江委重码站保较新；先于水利部合入——
+  // mwr 的江西站/水库按名让位；坐标 = mapSearch join + 人工表）
+  try {
+    const jx = await fetchJiangxi();
+    let added = 0;
+    for (const r of jx) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.jx = `ok ${added}/${jx.length}站`;
+  } catch (e) {
+    sources.jx = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] jx →', e.message);
   }
 
   // 11 号源：水利部全国水雨情（最后合入；伪码 mwr_ 不会撞站码，但站名去重必须做——
