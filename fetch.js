@@ -541,10 +541,74 @@ async function fetchHunan() {
   return rows;
 }
 
+// 湖南水库（同一张图平台的 rsvr 接口，逐小时；只收 8 位老码大中型水库约 95 个——
+// rsvr/list 全量 1 万+ 山塘小库，噪声太多；process 字段 RZ 库水位/W 蓄量/汛限等，只取 RZ 逐时线）
+const HN_RSVR_LIST_API = 'http://58.20.42.94:9090/newapi/api/v1/ysq/rsvr/list';
+const HN_RSVR_PROC_API = 'http://58.20.42.94:9090/newapi/api/v1/ysq/rsvr/process';
+
+async function fetchHunanRsvr() {
+  const win = { stm: bjHourStr(-26) + ':00:00', etm: bjHourStr(0) + ':00:00' };
+  const base = JSON.parse(await fetchPost(HN_RSVR_LIST_API, JSON.stringify({ adcd: '430000', ...win, keyword: '' }), 60000));
+  const pool = ((base.data || {}).list || []).filter(
+    (s) => /^\d{8}$/.test(s.STCD1) && isFinite(Number(s.LGTD)) && isFinite(Number(s.LTTD))
+  );
+  if (pool.length < 20) throw new Error('水库站表异常：老码站只剩 ' + pool.length);
+  const parseTm = (s) => {
+    const m = String(s || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0;
+  };
+  const now = Date.now();
+  const rows = [];
+  let idx = 0;
+  const worker = async () => {
+    while (idx < pool.length) {
+      const s = pool[idx++];
+      try {
+        const j = JSON.parse(await fetchPost(HN_RSVR_PROC_API, JSON.stringify({ stcd: s.STCD1, ...win }), 20000));
+        const list = ((j.data || {}).list || []).filter((p) => p && p.RZ != null && isFinite(Number(p.RZ)));
+        let meta = null, maxT = 0;
+        for (const p of list) {
+          const t = parseTm(p.TM);
+          if (t && t >= maxT) { maxT = t; meta = p; }
+        }
+        if (!meta || maxT < now - 30 * 3600e3) continue;
+        const pts = list
+          .map((p) => ({ t: parseTm(p.TM), z: Math.round(Number(p.RZ) * 100) / 100 }))
+          .filter((p) => p.t && p.t >= now - 26 * 3600e3)
+          .sort((a, b) => a.t - b.t);
+        const last = pts[pts.length - 1];
+        const dz = pts.length >= 2 ? last.z - pts[pts.length - 2].z : NaN;
+        rows.push({
+          stcd: s.STCD1,
+          stnm: String(s.STNM || s.STCD1).trim(),
+          rvnm: String(meta.RVNM || s.RVNM || '').trim() || '湖南',
+          z: last.z,
+          q: 0, // process 无流量列（DSFLZ/CKFLZ 是设计/校核洪水位不是流量）
+          tm: last.t,
+          w: !isFinite(dz) ? 'unk' : dz > 0.01 ? 'rise' : dz < -0.01 ? 'fall' : 'flat',
+          src: 'hn',
+          lgtd: Math.round(Number(s.LGTD) * 1e5) / 1e5,
+          lttd: Math.round(Number(s.LTTD) * 1e5) / 1e5,
+          // 水库的 HHRZ 是汛限水位、与河道「警戒」语义不同，拿不准就不标，避免客户端误判超警
+          h: pts.map((p) => [p.t, p.z]),
+        });
+      } catch (e) { /* 单站失败不影响整源 */ }
+    }
+  };
+  await Promise.all(Array.from({ length: 8 }, worker));
+  if (rows.length < 20) throw new Error('水库逐时线只拉到 ' + rows.length + ' 站');
+  console.log(`[ok] hn 湖南水库一张图 ${rows.length}/${pool.length} 站`);
+  return rows;
+}
+
 async function fetchMwr() {
   const txt = await fetchPost(MWR_API, '{}', 45000);
   const j = JSON.parse(txt);
-  const arr = (j.result || []).filter((r) => r && r.stType === 'river' && r.z != null && r.lgtd && r.lttd);
+  // 河道（z）+ 水库（rz，直接带在 mapSearch 结果里，不用逐站 info）；
+  // 河道剔浙闽/太湖（太湖局小时级已覆盖），水库全国收——浙闽水库太湖局没收（只收了河道/潮位/闸坝）
+  const arr = (j.result || []).filter(
+    (r) => r && (r.stType === 'river' || r.stType === 'rsvr') && (r.z != null || r.rz != null) && r.lgtd && r.lttd
+  );
   const dec = (s) => {
     try {
       return Number(Buffer.from(Buffer.from(String(s), 'base64').toString('utf8'), 'base64').toString('utf8'));
@@ -554,15 +618,16 @@ async function fetchMwr() {
   };
   const rows = [];
   for (const r of arr) {
-    if (r.addvnm === '浙江' || r.addvnm === '福建' || /太湖/.test(r.bsnm || '')) continue;
+    const isRsvr = r.stType === 'rsvr';
+    if (!isRsvr && (r.addvnm === '浙江' || r.addvnm === '福建' || /太湖/.test(r.bsnm || ''))) continue;
     const lgtd = dec(r.lgtd), lttd = dec(r.lttd);
     if (!isFinite(lgtd) || !isFinite(lttd)) continue;
     const m = String(r.tm || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
     rows.push({
-      stcd: 'mwr_' + r.idNo,
+      stcd: (isRsvr ? 'mwrr_' : 'mwr_') + r.idNo, // 坑：rsvr 与 river 各自独立编号、idNo 全量互撞（river 494=卢氏，rsvr 494=白盆珠），必须分前缀
       stnm: String(r.stnm || ''),
-      rvnm: String(r.rvnm || r.bsnm || '未知河流'),
-      z: Math.round(Number(r.z) * 100) / 100,
+      rvnm: String(r.rvnm || r.bsnm || (isRsvr ? '水库' : '未知河流')),
+      z: Math.round(Number(isRsvr ? r.rz : r.z) * 100) / 100,
       q: 0,
       tm: m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0,
       w: 'unk',
@@ -572,7 +637,7 @@ async function fetchMwr() {
     });
   }
   if (!rows.length) throw new Error('接口没解析到站点');
-  console.log(`[ok] mwr 水利部全国水雨情 ${rows.length} 站（浙闽/太湖已剔除）`);
+  console.log(`[ok] mwr 水利部全国水雨情 ${rows.length} 站（河道+水库，河道浙闽/太湖已剔除）`);
   return rows;
 }
 
@@ -837,7 +902,7 @@ async function main() {
     console.log('[fail] mot →', e.message);
   }
 
-  // 14 号源：湖南水文一张图（真实中央报汛码，同码保留较新者；先于水利部合入——
+  // 14 号源：湖南水文一张图（河道+水库，真实中央报汛码，同码保留较新者；先于水利部合入——
   // mwr 的湖南日报站按名去重自动让位给这套小时级数据）
   try {
     const hn = await fetchHunan();
@@ -846,7 +911,18 @@ async function main() {
       const prev = byStcd.get(r.stcd);
       if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
     }
-    sources.hn = `ok ${added}/${hn.length}站`;
+    let rsvrAdded = 0, rsvrTotal = 0;
+    try {
+      const hnr = await fetchHunanRsvr();
+      rsvrTotal = hnr.length;
+      for (const r of hnr) {
+        const prev = byStcd.get(r.stcd);
+        if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); rsvrAdded++; }
+      }
+    } catch (e) {
+      console.log('[fail] hn水库 →', e.message); // 水库挂了不算整源失败，河道计数照常
+    }
+    sources.hn = `ok ${added}/${hn.length}站${rsvrTotal ? `+水库${rsvrAdded}/${rsvrTotal}` : ''}`;
   } catch (e) {
     sources.hn = 'fail ' + String(e.message || e).slice(0, 40);
     console.log('[fail] hn →', e.message);
