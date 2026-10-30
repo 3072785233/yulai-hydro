@@ -46,6 +46,16 @@ const HB_STATIONS = [
 // 注意走 http：该站 TLS 是老旧 legacy renegotiation，Node18+（OpenSSL 3）握手直接拒绝
 const HB_BASE = 'http://hbwater.wetruetech.com/water/portal/wx_station_info?stationCode=';
 
+// 8 号源：交通运输部「珠江水情信息」每日公告（每日 8 时，约 13 站）
+// 珠江委官网被 WAF 挡、广东各水文站 DNS 全死，交通部这条路是珠江流域唯一公开直出源
+// 注意：部分站水位为当地/冻结基面（石角 1m、高要 0.9m 量级），非绝对高程，站对象标 src:'zj' 区分
+const ZJ_LIST = 'https://www.mot.gov.cn/fuwu/yujingtishi/zhujiangshuiqingxx/';
+// 站名 → 河名（只标有把握的，其余统一「珠江水系」不硬编）
+const ZJ_RIVERS = {
+  '南宁（三）': '郁江', 贵港: '郁江', '大湟江口（二）': '浔江', '梧州（四）': '西江',
+  高要: '西江', 石角: '北江', 柳州: '柳江', 武宣: '黔江', 迁江: '红水河',
+};
+
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
@@ -186,6 +196,50 @@ async function fetchHubei() {
   return rows;
 }
 
+/** 站名 → 稳定伪站码（zj_ 前缀 + djb2 哈希），沿用 mot 的做法 */
+function zjId(name) {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) >>> 0;
+  return 'zj_' + h.toString(16);
+}
+
+/** 交通部「珠江水情信息」：列表页第一篇即最新 → 正文表格 td 为 站名/时间/水位/流量 四列一组（内嵌 span，需剥标签） */
+async function fetchZhujiang() {
+  const listHtml = await fetchText(ZJ_LIST, 25000);
+  const link = listHtml.match(/href="(\.\/\d{6}\/t\d+_\d+\.html)"/); // 列表按新到旧，第一篇最新
+  if (!link) throw new Error('列表页没找到文章链接');
+  const artUrl = new URL(link[1], ZJ_LIST).href;
+  const html = await fetchText(artUrl, 25000);
+  // 年月藏在文章路径 /202610/ 里；日和时在表格「10-29 08:00」里
+  const ym = artUrl.match(/\/(\d{4})(\d{2})\/t\d+_\d+\.html/);
+  if (!ym) throw new Error('文章路径里没有年月');
+  const tds = [...html.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
+    .map((m) => m[1].replace(/<[^>]+>/g, '').replace(/&nbsp;|　/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const rows = [];
+  for (let i = 0; i < tds.length - 3; i++) {
+    const tmM = tds[i + 1].match(/^(\d{2})-(\d{2}) (\d{2}):\d{2}$/);
+    if (!tmM || !/^[\d.]+$/.test(tds[i + 2]) || !/^[\d.]+$/.test(tds[i + 3])) continue;
+    if (tds[i] === '站名') continue;
+    const z = Number(tds[i + 2]);
+    const q = Number(tds[i + 3]);
+    if (!isFinite(z)) continue;
+    rows.push({
+      stcd: zjId(tds[i]),
+      stnm: tds[i],
+      rvnm: ZJ_RIVERS[tds[i]] || '珠江水系',
+      z: Math.round(z * 100) / 100,
+      q: Math.round(q * 100) / 100,
+      tm: Date.UTC(+ym[1], +ym[2] - 1, +tmM[2], +tmM[3] - 8, 0, 0),
+      w: 'unk',
+      src: 'zj',
+    });
+  }
+  if (!rows.length) throw new Error('文章里没解析到站点行');
+  console.log(`[ok] zj 交通部珠江水情 ${ym[1]}-${ym[2]} · ${rows.length} 站`);
+  return rows;
+}
+
 function parsePage(html) {
   const m = html.match(/var sssq ?= ?(\[[\s\S]*?\]);/);
   if (!m) return null;
@@ -265,6 +319,16 @@ async function main() {
   } catch (e) {
     sources.hb = 'fail ' + String(e.message || e).slice(0, 40);
     console.log('[fail] hb →', e.message);
+  }
+
+  // 8 号源：交通部珠江水情公告（独立容错；珠江流域首批站，全部为新增）
+  try {
+    const zj = await fetchZhujiang();
+    for (const r of zj) byStcd.set(r.stcd, r);
+    sources.zj = `ok ${zj.length}站`;
+  } catch (e) {
+    sources.zj = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] zj →', e.message);
   }
 
   // 6 号源：交通部每日水位表（独立容错：它挂了不影响长江委 5 源；与长江委重名站跳过——水文口径小时级更优）
