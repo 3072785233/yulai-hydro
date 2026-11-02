@@ -601,6 +601,101 @@ async function fetchHunanRsvr() {
   return rows;
 }
 
+// 16 号源：安徽省水信息系统「实时水情」（yc.wswj.net 前端被 IP 屏蔽，但后端 handler 裸 IP 直连可用）。
+// 接口双向自研加密（waterEncode 2.1）：请求=encodeURIComponent→奇偶换位→base64→"2.1"前缀；
+// 响应=base64 分段+4 字符标签乱序+末尾标签序列还原（BadRuan/water-spider 逆向稿移植，已在真机验签）。
+// GetSwInfo 一发拿全省 1556 站总表（真实中央站码+坐标+实时水位/流量/警戒保证+市县），
+// 只收 ZQ 河道 244 + RR 水库 135（共 ~380 站约 40KB；ZZ 水位站 688 个体量装不下，等 V2 拆文件再收）；
+// 无逐站历史线——走势由小时流水线快照自然积累（同太湖/山东方案，服务器压力最小）。
+// 与长江委撞码站（九江/大通/湖口/新安江水系）同码保较新，自动裁决
+const AH_API = 'http://61.191.22.196:5566/AHSXX/service/PublicBusinessHandler.ashx';
+
+/** waterEncode 2.1 请求加密：quote 后字节奇偶换位再 base64（奇数长补 *） */
+function ahEncode(s) {
+  let str = encodeURIComponent(String(s));
+  const bytes = Buffer.from(str, 'utf8');
+  if (bytes.length % 2 !== 0) str += '*';
+  const b = Buffer.from(str, 'utf8');
+  for (let i = 0; i + 1 < b.length; i += 2) {
+    const t = b[i];
+    b[i] = b[i + 1];
+    b[i + 1] = t;
+  }
+  return '2.1' + b.toString('base64');
+}
+
+/** waterEncode 2.1 响应解密：末 4 字符定位标签序列，按标签首现位置切段、标签序重组后 base64 */
+function ahDecode(data) {
+  if (typeof data !== 'string' || data.length < 5) return '';
+  if (data.slice(0, 3) !== '2.1') return data; // 版本不符按明文原样返回
+  const d = data.slice(3);
+  const endTag = d.slice(-4);
+  const at = d.indexOf(endTag);
+  if (at < 0) return '';
+  const mid = d.slice(at + 4, -4); // 标签序列（去掉首尾标记）
+  const tags = [];
+  for (let i = 0; i < mid.length; i += 4) tags.push(mid.slice(i, i + 4));
+  const positions = tags.map((t) => d.indexOf(t)).filter((p) => p >= 0).sort((a, b) => a - b);
+  const seg = {};
+  let idx = 0;
+  for (const pos of positions) {
+    seg[d.slice(pos, pos + 4)] = d.slice(idx, pos);
+    idx = pos + 4;
+  }
+  return Buffer.from(tags.map((t) => seg[t] || '').join(''), 'base64').toString('utf8');
+}
+
+async function fetchAnhui() {
+  const body = new URLSearchParams({
+    name: ahEncode('GetSwInfo'),
+    stcd: ahEncode('60115400'), // GetSwInfo 不看站码，参数形状照抄前端
+    btime: ahEncode(bjHourStr(-24).replace(/[-: ]/g, '') + '00'), // 平台要 YYYYMMDDHHMM 纯数字
+    etime: ahEncode(bjHourStr(0).replace(/[-: ]/g, '') + '00'),
+    sttp: ahEncode('ZQ'),
+    waterEncode: ahEncode('true'),
+  }).toString();
+  const j = JSON.parse(await fetchPost(AH_API, body, 60000));
+  if (String(j.respCode) !== '0') throw new Error('respCode=' + j.respCode + ' ' + (j.respMsg || ''));
+  const list = JSON.parse(ahDecode(j.data));
+  if (!Array.isArray(list) || list.length < 500) throw new Error('站表异常：只回 ' + (list && list.length) + ' 行');
+  const parseTm = (s) => {
+    const m = String(s || '').match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0;
+  };
+  const now = Date.now();
+  const rows = [];
+  let rsvr = 0;
+  for (const s of list) {
+    const isRsvr = s.STTP === 'RR';
+    if (s.STTP !== 'ZQ' && !isRsvr) continue;
+    if (!/^\d{8}$/.test(s.STCD)) continue;
+    const lat = Number(s.LGTD);
+    const lng = Number(s.LTTD);
+    const z = s.Z === '' || s.Z == null ? NaN : Number(s.Z);
+    const tm = parseTm(s.TM);
+    if (!isFinite(lat) || !isFinite(lng) || !isFinite(z) || !tm) continue;
+    if (now - tm > 30 * 3600e3) continue; // 断讯/僵尸站不带进库
+    const q = Number(s.Q);
+    const wrz = !isRsvr && s.JJSW !== '' && isFinite(Number(s.JJSW)) ? Math.round(Number(s.JJSW) * 100) / 100 : undefined;
+    rows.push({
+      stcd: s.STCD,
+      stnm: String(s.STNM || s.STCD).trim(),
+      rvnm: String(s.RVNM || '').trim() || (isRsvr ? '水库' : '安徽'),
+      z: Math.round(z * 100) / 100,
+      q: isFinite(q) && q > 0 ? Math.round(q) : 0,
+      tm,
+      wrz, // 水库无警戒语义（汛限≠警戒），河道 JJSW 才上
+      src: 'ah',
+      lgtd: Math.round(lat * 1e5) / 1e5,
+      lttd: Math.round(lng * 1e5) / 1e5,
+    });
+    if (isRsvr) rsvr++;
+  }
+  if (rows.length < 100) throw new Error('只滤出 ' + rows.length + ' 站');
+  console.log(`[ok] ah 安徽水信息系统 ${rows.length}/${list.length} 站（河道${rows.length - rsvr}+水库${rsvr}，一发总表无逐站请求）`);
+  return rows;
+}
+
 // 15 号源：江西省水雨情平台（省水利厅官网「江河水情」iframe 真身，GET 明文 JSON 无鉴权）。
 // 河道 26 重点站（带流量/警戒/距警戒，全部到乡镇级 county）+ 大中型水库 32（带库水位/入库出库/蓄量/汛限）。
 // 坑：站表不带坐标——先拿水利部 mapSearch 按站名 join，join 不上的查 JX_COORDS 人工表
@@ -1021,6 +1116,21 @@ async function main() {
   } catch (e) {
     sources.hn = 'fail ' + String(e.message || e).slice(0, 40);
     console.log('[fail] hn →', e.message);
+  }
+
+  // 16 号源：安徽水信息系统（真实站码，与长江委撞码站保较新；先于水利部合入——
+  // mwr 的安徽站/淮河站按名让位给这套小时级总表）
+  try {
+    const ah = await fetchAnhui();
+    let added = 0;
+    for (const r of ah) {
+      const prev = byStcd.get(r.stcd);
+      if (!prev || r.tm >= prev.tm) { byStcd.set(r.stcd, r); added++; }
+    }
+    sources.ah = `ok ${added}/${ah.length}站`;
+  } catch (e) {
+    sources.ah = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] ah →', e.message);
   }
 
   // 15 号源：江西水雨情（真实站码，与长江委重码站保较新；先于水利部合入——
