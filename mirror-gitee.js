@@ -16,7 +16,7 @@ const blobSha = (buf) => crypto.createHash('sha1').update(`blob ${buf.length}\0`
 
 (async () => {
   let failed = 0;
-  for (const file of ['data/hydro.json', 'data/tides.json']) {
+  for (const file of ['data/hydro.json', 'data/rsvr.json', 'data/tides.json']) {
     try {
       const local = fs.readFileSync(path.join(__dirname, file));
       const api = `https://gitee.com/api/v5/repos/${REPO}/contents/${file}`;

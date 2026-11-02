@@ -151,6 +151,7 @@ const TIDE_PORTS = [
 ];
 
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
+const RSVR_FILE = path.join(__dirname, 'data', 'rsvr.json'); // V2 拆文件：水库站独立（mwrr_ 全国 + hn/jx/ah 水库）
 const TIDE_FILE = path.join(__dirname, 'data', 'tides.json');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
@@ -587,6 +588,7 @@ async function fetchHunanRsvr() {
           tm: last.t,
           w: !isFinite(dz) ? 'unk' : dz > 0.01 ? 'rise' : dz < -0.01 ? 'fall' : 'flat',
           src: 'hn',
+          rsvr: 1, // V2 拆文件：水库站独立 rsvr.json（按需加载，主表给河道腾体积）
           lgtd: Math.round(Number(s.LGTD) * 1e5) / 1e5,
           lttd: Math.round(Number(s.LTTD) * 1e5) / 1e5,
           // 水库的 HHRZ 是汛限水位、与河道「警戒」语义不同，拿不准就不标，避免客户端误判超警
@@ -667,7 +669,7 @@ async function fetchAnhui() {
   let rsvr = 0;
   for (const s of list) {
     const isRsvr = s.STTP === 'RR';
-    if (s.STTP !== 'ZQ' && !isRsvr) continue;
+    if (s.STTP !== 'ZQ' && s.STTP !== 'ZZ' && s.STTP !== 'TT' && !isRsvr) continue; // ZZ 水位站 631 个（淮河干支流正牌站）随 V2 拆文件全量收；TT 潮位站仅 2 个（芜湖/安庆长江感潮段）顺手
     if (!/^\d{8}$/.test(s.STCD)) continue;
     const lat = Number(s.LGTD);
     const lng = Number(s.LTTD);
@@ -686,6 +688,7 @@ async function fetchAnhui() {
       tm,
       wrz, // 水库无警戒语义（汛限≠警戒），河道 JJSW 才上
       src: 'ah',
+      ...(isRsvr ? { rsvr: 1 } : {}), // V2 拆文件：安徽水库进 rsvr.json
       lgtd: Math.round(lat * 1e5) / 1e5,
       lttd: Math.round(lng * 1e5) / 1e5,
     });
@@ -780,6 +783,7 @@ async function fetchJiangxi() {
         w: trendOf(String(r.wptn)), // 江西水势列多为「—」，涨落靠 h 走势积累
         ...(p[1] && isFinite(Number(r.wrz)) ? { wrz: Math.round(Number(r.wrz) * 100) / 100 } : {}),
         src: 'jx',
+        ...(p[1] ? {} : { rsvr: 1 }), // V2 拆文件：江西水库进 rsvr.json
         lgtd: Math.round(geo[1] * 1e5) / 1e5,
         lttd: Math.round(geo[0] * 1e5) / 1e5,
       });
@@ -822,6 +826,7 @@ async function fetchMwr() {
       tm: m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], 0) : 0,
       w: 'unk',
       src: 'mwr',
+      ...(isRsvr ? { rsvr: 1 } : {}), // V2 拆文件：全国水库（mwrr_ 前缀）进 rsvr.json
       lgtd: Math.round(lgtd * 1e5) / 1e5,
       lttd: Math.round(lttd * 1e5) / 1e5,
     });
@@ -1175,26 +1180,39 @@ async function main() {
   }
 
   // 合并上一次快照的走势（GitHub Actions 每小时一次，累积出 24h 变幅）
-  let prev = null;
+  // V2 拆文件：走势继承与断源保留都要看两份旧文件（河道主表 + 水库表）
+  let prev = { stations: [] };
+  const prevRsvrSet = new Set(); // 上一轮就在水库文件里的站，这轮保持归库不跳槽
   try {
-    prev = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const p = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (Array.isArray(p.stations)) prev.stations = prev.stations.concat(p.stations);
   } catch (e) { /* 首次运行 */ }
+  try {
+    const p = JSON.parse(fs.readFileSync(RSVR_FILE, 'utf8'));
+    if (Array.isArray(p.stations)) {
+      p.stations.forEach((s) => prevRsvrSet.add(s.stcd));
+      prev.stations = prev.stations.concat(p.stations);
+    }
+  } catch (e) { /* 水库文件还没生成过 */ }
 
   const now = Date.now();
   const stations = [];
+  const rsvrStcds = new Set(prevRsvrSet); // 本轮新进水库的站在装配循环里补进
   for (const [stcd, r] of byStcd) {
-    const old = prev && Array.isArray(prev.stations) ? prev.stations.find((x) => x.stcd === stcd) : null;
+    const old = prev.stations.find((x) => x.stcd === stcd);
     let h = Array.isArray(old && old.h) ? old.h.slice() : [];
     if (Array.isArray(r.h)) h.push(...r.h); // hn 自带 26h 窗口逐时线，首跑即有完整走势
     if (r.tm && r.z != null) h.push([r.tm, r.z]); // 时间戳重/超窗的由下方过滤统一清理
-    // 去重 + 只留近 26h + 降采样到 ≤10 点（小时级源上千站，全量走势会把文件撑爆；10 点算 24h 变幅够用）
+    if (r.rsvr) rsvrStcds.add(stcd);
+    // 去重 + 只留近 26h + 降采样（小时级源上千站，全量走势会把文件撑爆；安徽站多 1 千个，只留 3 点≈8h 一档，算 24h 变幅够用）
+    const cap = r.src === 'ah' ? 3 : 10;
     const seen = new Set();
     h = h
       .filter(([t]) => t >= now - 26 * 3600e3 && !seen.has(t) && seen.add(t))
       .sort((a, b) => a[0] - b[0]);
-    if (h.length > 10) {
-      const step = (h.length - 1) / 9;
-      h = Array.from({ length: 10 }, (_, i) => h[Math.round(i * step)]);
+    if (h.length > cap) {
+      const step = (h.length - 1) / (cap - 1);
+      h = Array.from({ length: cap }, (_, i) => h[Math.round(i * step)]);
     }
     const st = {
       stcd,
@@ -1215,11 +1233,12 @@ async function main() {
   }
   // 短暂断源的站不硬删：上一轮快照有、这轮没抓到且数据还在 48h 内的，原样保留
   // （比如湖北平台偶发 413/500 封一轮——站消失一小时比显示两小时前的读数更伤）
-  if (prev && Array.isArray(prev.stations)) {
+  {
     const have = new Set(stations.map((s) => s.stcd));
     let kept = 0;
     for (const old of prev.stations) {
       if (have.has(old.stcd) || !old.tm || old.tm < now - 48 * 3600e3) continue;
+      if (String(old.stcd).indexOf('mwrr_') === 0) rsvrStcds.add(old.stcd); // 拆文件过渡期：旧主表里的全国水库按前缀归队水库文件，别在主表滞留 48h
       stations.push(old);
       kept++;
     }
@@ -1228,13 +1247,20 @@ async function main() {
 
   stations.sort((a, b) => (a.rvnm + a.stnm).localeCompare(b.rvnm + b.stnm, 'zh'));
 
-  const out = { v: 1, updated: new Date().toISOString(), sources, stations };
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  fs.writeFileSync(DATA_FILE, JSON.stringify(out));
-  const size = Math.round(fs.statSync(DATA_FILE).size / 1024);
+  // V2 拆文件：水库站独立 data/rsvr.json（客户端合并展示，主表体积给河道让路——安徽 ZZ 631 站因此全量收）
+  const hydroSt = stations.filter((s) => !rsvrStcds.has(s.stcd));
+  const rsvrSt = stations.filter((s) => rsvrStcds.has(s.stcd));
+  const write = (file, arr) => {
+    const o = { v: 1, updated: new Date().toISOString(), sources, stations: arr };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(o));
+    return Math.round(fs.statSync(file).size / 1024);
+  };
+  const size = write(DATA_FILE, hydroSt);
+  const sizeR = write(RSVR_FILE, rsvrSt);
   const withD = stations.filter((s) => s.d24 != null).length;
-  console.log(`写入 data/hydro.json：${stations.length} 站 · ${withD} 站有24h变幅 · ${size}KB`);
-  if (size > 700) console.log('::warning::文件超 700KB，真机加载变慢——考虑收紧采集范围或走势降采样更狠');
+  console.log(`写入 data/hydro.json：${hydroSt.length} 站 · ${size}KB ｜ data/rsvr.json：${rsvrSt.length} 站 · ${sizeR}KB（共 ${stations.length} 站 · ${withD} 站有24h变幅）`);
+  if (size > 700 || sizeR > 700) console.log('::warning::数据文件超 700KB，真机加载变慢——考虑收紧采集范围或走势降采样更狠');
 
   // 潮汐表（独立于水情：它挂了水情照常，反之亦然）
   try {

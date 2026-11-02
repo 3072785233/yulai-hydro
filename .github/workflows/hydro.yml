@@ -27,7 +27,7 @@ jobs:
         run: |
           git config user.name "hydro-bot"
           git config user.email "hydro-bot@users.noreply.github.com"
-          git add data/hydro.json
+          git add data/ # 全量：hydro + rsvr（V2 拆文件）+ tides（修隐性 bug：此前只 add hydro，潮汐新抓取从不入库，只能靠 API 兜底碰运气落 Gitee）
           if git diff --cached --quiet; then echo "数据无变化"; exit 0; fi
           git commit -m "hydro $(date -u +%FT%TZ) [skip ci]" # [skip ci]：数据提交不再触发 push 跑批，防死循环
           git push
@@ -51,4 +51,6 @@ jobs:
       - name: 刷新 jsDelivr CDN 缓存（免认证，让备用地址也保持新鲜）
         run: |
           sleep 10
-          curl -sfL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/data/hydro.json" >/dev/null && echo "jsDelivr 已刷新" || echo "purge 失败（不阻塞）"
+          for f in hydro.json rsvr.json tides.json; do
+            curl -sfL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/data/$f" >/dev/null && echo "jsDelivr 已刷新 $f" || echo "purge 失败 $f（不阻塞）"
+          done
