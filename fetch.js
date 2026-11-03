@@ -872,6 +872,78 @@ async function fetchCjhdj() {
   return rows;
 }
 
+/** 17 号源 · 黄委黄河水情：官网首页「黄河水情」外链带 sr 令牌（Forms 认证自动登入），
+ *  三跳重定向手工攒 cookie 才能落地 hwsq2.aspx 实时表。表列 = 河名/站名/时间/水位/流量，
+ *  HTML 残缺（span 从不闭合、直接 </td>），按 span→</td> 切列。干流 16 站水位为绝对高程、
+ *  全带流量——正好补上 mwr 全国源 q=0 的缺口；时间不带年份，跨年归上一年。 */
+const YRCC_HOME = 'http://www.yrcc.gov.cn';
+const YRCC_BASE = 'http://61.163.88.227:8006';
+const YRCC_COORDS = {
+  // 站名 → [lttd, lgtd]（黄河干流控制站坐标，同名校验用：只换坐标邻近的同名站，避免误杀浙江龙门这类远房）
+  玛曲: [34.02, 102.08], 兰州: [36.06, 103.82], 石嘴山: [39.24, 106.78], 巴彦高勒: [40.33, 107.0],
+  头道拐: [40.27, 111.19], 吴堡: [37.45, 110.74], 龙门: [35.66, 110.58], 华县: [34.51, 109.52],
+  潼关: [34.55, 110.29], 三门峡水库: [34.82, 111.1], 黑石关: [34.74, 112.96], 武陟: [35.1, 113.4],
+  花园口: [34.92, 113.65], 高村: [35.34, 115.42], 泺口: [36.73, 116.98], 利津: [37.55, 118.26],
+};
+const yrccId = (name) => {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) >>> 0;
+  return 'yrcc_' + h.toString(16);
+};
+async function fetchYrcc() {
+  const home = await fetchText(YRCC_HOME, 25000);
+  const tk = home.match(/hwsq2\.aspx\?sr=([A-Za-z0-9]+)/);
+  if (!tk) throw new Error('官网首页没找到水情入口令牌');
+  // Forms 认证舞步：hwsq2 302→default?ReturnUrl（发会话 cookie）→302→hwsq2（真身）
+  let cookie = '';
+  const get = async (url) => {
+    const res = await fetch(url, {
+      redirect: 'manual',
+      headers: { 'User-Agent': UA, ...(cookie ? { Cookie: cookie } : {}) },
+    });
+    const set = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    if (set.length) cookie = (cookie ? cookie + '; ' : '') + set.map((c) => c.split(';')[0]).join('; ');
+    return res;
+  };
+  let res = await get(`${YRCC_BASE}/hwsq2.aspx?sr=${tk[1]}`);
+  for (let hop = 0; res.status >= 300 && res.status < 400 && hop < 4; hop++) {
+    res = await get(new URL(res.headers.get('location'), YRCC_BASE).href);
+  }
+  if (!res.ok) throw new Error('黄河水情页 HTTP ' + res.status);
+  const html = await res.text();
+
+  const rows = [];
+  for (const tr of html.match(/<tr[\s\S]*?<\/tr>/g) || []) {
+    const td = [...tr.matchAll(/<span[^>]*>([^<]*)<\/td>/g)].map((m) => m[1].trim());
+    if (td.length < 5 || !/^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.test(td[2])) continue;
+    const [, mm, dd, hh, mi] = td[2].match(/^(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+    const bj = new Date(Date.now() + 8 * 3600e3);
+    let year = bj.getUTCFullYear();
+    let tm = Date.UTC(year, mm - 1, +dd, hh - 8, mi);
+    if (tm > Date.now() + 26 * 3600e3) tm = Date.UTC(--year, mm - 1, +dd, hh - 8, mi); // 元旦前后归上一年
+    const z = Number(td[3]);
+    const q = Number(td[4]);
+    if (!YRCC_COORDS[td[1]] || !isFinite(z)) continue;
+    const isRsvr = td[1].includes('水库');
+    rows.push({
+      stcd: yrccId(td[1]),
+      stnm: td[1],
+      rvnm: isRsvr ? '黄河' : td[0],
+      z: Math.round(z * 100) / 100,
+      q: isFinite(q) && q > 0 ? Math.round(q * 100) / 100 : 0,
+      tm,
+      w: 'unk',
+      src: 'yrcc',
+      lttd: YRCC_COORDS[td[1]][0],
+      lgtd: YRCC_COORDS[td[1]][1],
+      ...(isRsvr ? { rsvr: 1 } : {}),
+    });
+  }
+  if (rows.length < 8) throw new Error(`只解析到 ${rows.length} 站`);
+  console.log(`[ok] yrcc 黄委黄河水情 ${rows[0].tm ? new Date(rows[0].tm + 8 * 3600e3).toISOString().slice(5, 16).replace('T', ' ') : ''} · ${rows.length} 站（干流水位+流量，8时日报）`);
+  return rows;
+}
+
 /** 潮汐表：逐港抓页 → showTides 三参 → zlib inflate 出 24 整点潮高（cm）。
  *  每日一更：tides.json 的 date 与今日（北京时）相同则整段跳过，别对人家站点一小时打 85 发 */
 async function fetchTides() {
@@ -1174,6 +1246,35 @@ async function main() {
     console.log('[fail] mwr →', e.message);
   }
 
+  // 17 号源：黄委黄河水情（压轴合入——mwr 的黄河站 q=0 无流量，yrcc 每日 8 时全带流量；
+  // 按名+坐标邻近换掉 mwr 同站行（浙江龙门这类同名远站不碰））
+  let yrccRows = null;
+  try {
+    yrccRows = await fetchYrcc();
+    const norm = (n) => String(n).replace(/[(（].*$/, '').trim();
+    let upd = 0, add = 0;
+    for (const r of yrccRows) {
+      const c = YRCC_COORDS[r.stnm];
+      let old = null;
+      for (const [xStcd, x] of byStcd) {
+        if (norm(x.stnm) !== norm(r.stnm)) continue;
+        if (x.lgtd == null || Math.abs(x.lgtd - c[1]) > 1.5 || Math.abs(x.lttd - c[0]) > 1.5) continue;
+        if (!old) old = x; // 首个命中行继承坐标；mwr 伪码按行序编号跨运行不稳，同区同名行可能不止一条，一并清掉
+        byStcd.delete(xStcd);
+      }
+      if (old) {
+        if (old.lgtd != null) { r.lgtd = old.lgtd; r.lttd = old.lttd; } // 坐标沿用上游权威值
+        upd++;
+      } else add++;
+      byStcd.set(r.stcd, r);
+    }
+    sources.yrcc = `ok ${upd}更/${add}新`;
+    console.log(`     yrcc 换下 ${upd} 站补流量（mwr 同站）+ 净增 ${add} 站`);
+  } catch (e) {
+    sources.yrcc = 'fail ' + String(e.message || e).slice(0, 40);
+    console.log('[fail] yrcc →', e.message);
+  }
+
   if (!byStcd.size) {
     console.error('全部数据源失败，保留旧文件');
     process.exit(1);
@@ -1194,6 +1295,22 @@ async function main() {
       prev.stations = prev.stations.concat(p.stations);
     }
   } catch (e) { /* 水库文件还没生成过 */ }
+  // yrcc 换下的站从旧快照除名，断源保留别再拉回来——mwr 伪码按行序编号跨运行会漂移，
+  // 幽灵行（旧码+旧读数）不在本轮 byStcd 里，只能拿 yrcc 行按名+坐标邻近直接扫 prev
+  if (yrccRows) {
+    const norm = (n) => String(n).replace(/[(（].*$/, '').trim();
+    const near = (x) => {
+      if (x.lgtd == null) return false;
+      return yrccRows.some((r) => {
+        if (norm(x.stnm) !== norm(r.stnm)) return false;
+        const c = YRCC_COORDS[r.stnm];
+        return Math.abs(x.lgtd - c[1]) <= 1.5 && Math.abs(x.lttd - c[0]) <= 1.5;
+      });
+    };
+    const before = prev.stations.length;
+    prev.stations = prev.stations.filter((x) => x.src === 'yrcc' || !near(x));
+    if (prev.stations.length < before) console.log(`     yrcc 清掉旧快照幽灵 ${before - prev.stations.length} 行（mwr 旧码同名站）`);
+  }
 
   const now = Date.now();
   const stations = [];
