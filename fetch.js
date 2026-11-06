@@ -153,6 +153,8 @@ const TIDE_PORTS = [
 const DATA_FILE = path.join(__dirname, 'data', 'hydro.json');
 const RSVR_FILE = path.join(__dirname, 'data', 'rsvr.json'); // V2 拆文件：水库站独立（mwrr_ 全国 + hn/jx/ah 水库）
 const TIDE_FILE = path.join(__dirname, 'data', 'tides.json');
+const TIDE_HIST_FILE = path.join(__dirname, 'data', 'tides-history.json'); // tide7：逐日归档（仓库侧，不镜像——体积随天数涨）
+const TIDE_FIT_FILE = path.join(__dirname, 'data', 'tides-fit.json'); // tide7：调和拟合参数（小文件，镜像给小程序用）
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36';
 
 // 水势码 → 语义（水情信息编码 SL 330：5涨 4落 6平；其余视为未知）
@@ -1384,6 +1386,32 @@ async function main() {
     await fetchTides();
   } catch (e) {
     console.log('[fail] tides →', e.message);
+  }
+
+  // 潮汐历史归档 + 调和拟合（tide7）：当日快照并入 tides-history.json（哪怕上面 [skip]，同日并入幂等），
+  // 攒够 15 天 fit.ok 自动置真，预报页「未来 7 天潮汐」点亮。挂了不影响水情主链路。
+  try {
+    const tidefit = require('./tidefit');
+    let hist = null;
+    try {
+      hist = JSON.parse(fs.readFileSync(TIDE_HIST_FILE, 'utf8'));
+    } catch (e) { /* 本地没有：试从 Gitee 拉一版当种子（新 clone / 换机器自愈，公开仓免令牌） */ }
+    if (!hist || !hist.days) {
+      try {
+        const seed = JSON.parse(await fetchText('https://gitee.com/Mortar630/yulai-hydro/raw/master/data/tides-history.json', 15000));
+        if (seed && seed.days) hist = seed;
+      } catch (e) { /* 拉不到就从今天开始攒 */ }
+    }
+    const snap = JSON.parse(fs.readFileSync(TIDE_FILE, 'utf8'));
+    hist = tidefit.mergeHistory(hist, snap);
+    fs.writeFileSync(TIDE_HIST_FILE, JSON.stringify(hist));
+    const dayN = Object.keys(hist.days).length;
+    const fit = tidefit.buildFits(hist);
+    fs.writeFileSync(TIDE_FIT_FILE, JSON.stringify(fit));
+    const okN = fit.ports.filter((p) => p.ok).length;
+    console.log(`[ok] tides-history 归档 ${dayN} 天 → tides-fit ${fit.ports.length} 港 · ${okN} 港可 7 天预报（门槛 ${tidefit.MIN_DAYS} 天）`);
+  } catch (e) {
+    console.log('[fail] tides-fit →', e.message);
   }
 }
 
